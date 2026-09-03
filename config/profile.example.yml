@@ -1,0 +1,10 @@
+# Fill these fields only in your local engine/config/profile.yml.
+target_roles:
+  primary: []
+  archetypes: []
+location:
+  country: ""
+compensation:
+  target_range: ""
+scan:
+  extractor: {}

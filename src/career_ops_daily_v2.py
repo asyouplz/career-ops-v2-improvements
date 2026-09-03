@@ -209,6 +209,16 @@ def load_profile_evidence(path: Path) -> dict[str, Any]:
             "error": _clean(f"{type(exc).__name__}: {exc}", MAX_ERROR_CHARS),
         }
 
+    if not configured.get("sources") and not configured.get("facts"):
+        return {
+            "status": "not_configured",
+            "sources_verified": False,
+            "source_checks": [],
+            "experience_years_min": None,
+            "target_levels": [],
+            "facts": [],
+            "error": None,
+        }
     source_results: list[dict[str, Any]] = []
     for source in configured.get("sources") or []:
         if not isinstance(source, dict):
@@ -366,6 +376,7 @@ def runtime_subprocess_env(runtime: dict[str, Any]) -> dict[str, str]:
         )
     if runtime.get("codex_bin"):
         env["CAREER_OPS_CODEX_BIN"] = str(runtime["codex_bin"])
+    env["CAREER_OPS_PYTHON"] = str(runtime.get("python_bin") or sys.executable)
     if runtime.get("legacy_ddgs_script"):
         env["CAREER_OPS_LEGACY_LINKEDIN_FETCH"] = str(runtime["legacy_ddgs_script"])
     run_id = _clean(runtime.get("_run_id"), 120)
@@ -420,6 +431,14 @@ def run_direct_linkedin(
         return {
             "schema_version": 1,
             "status": "skipped_network",
+            "source": "linkedin-direct-public",
+            "fallback_required": False,
+            "candidates": [],
+        }
+    if not (_json_load(linkedin_config_path).get("queries") or []):
+        return {
+            "schema_version": 1,
+            "status": "not_configured",
             "source": "linkedin-direct-public",
             "fallback_required": False,
             "candidates": [],
@@ -490,25 +509,15 @@ def collect_seen_linkedin_urls(project_root: Path) -> set[str]:
     return urls
 
 
-def _resolve_hermes_python() -> Path | None:
-    home = Path.home()
-    candidates = [
-        home / ".hermes" / "hermes-agent" / "venv" / "bin" / "python",
-        home / "hermes-agent" / "venv" / "bin" / "python",
-        home / ".local" / "share" / "hermes" / "venv" / "bin" / "python",
-    ]
-    return next((path for path in candidates if path.is_file()), None)
-
-
 def run_ddgs_fallback(runtime: dict[str, Any]) -> dict[str, Any]:
-    python = _resolve_hermes_python()
+    python = Path(str(runtime.get("python_bin") or sys.executable))
     script = Path(runtime["legacy_ddgs_script"])
     if python is None or not script.is_file():
         return {
             "status": "unavailable",
             "source": "linkedin-site-search-via-ddgs",
             "result_count": 0,
-            "error": "Hermes Python or legacy DDGS script not found",
+            "error": "Configured Python or bundled DDGS script not found",
         }
     attempts: list[dict[str, Any]] = []
     total_elapsed = 0.0
@@ -596,7 +605,10 @@ def run_direct_ingest_preview(
         str(runtime["production_project_root"]),
         "--apply" if apply else "--dry-run",
     ]
-    result = _run(command, cwd=STAGING_ROOT, timeout=120)
+    result = _run(
+        command, cwd=Path(runtime["production_project_root"]), timeout=120,
+        env=runtime_subprocess_env(runtime),
+    )
     try:
         payload = _parse_last_json(result["stdout"])
     except Exception as exc:  # noqa: BLE001

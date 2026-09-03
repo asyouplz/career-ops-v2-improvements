@@ -16,7 +16,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const STAGING_ROOT = resolve(MODULE_DIR, '..');
 const DEFAULT_CONFIG = join(STAGING_ROOT, 'config', 'linkedin_queries.json');
-const DEFAULT_PROJECT_ROOT = process.env.CAREER_OPS_PROJECT_ROOT || '';
+const DEFAULT_PROJECT_ROOT = process.env.CAREER_OPS_PROJECT_ROOT || join(STAGING_ROOT, 'engine');
 const PUBLIC_SEARCH_BASE = 'https://www.linkedin.com/jobs/search/';
 const PUBLIC_JOB_BASE = 'https://www.linkedin.com/jobs/view/';
 
@@ -260,6 +260,7 @@ async function loadPlaywright(projectRoot) {
   const candidates = [
     process.env.PLAYWRIGHT_MODULE,
     pathToFileURL(join(projectRoot, 'node_modules', 'playwright', 'index.mjs')).href,
+    'playwright',
   ].filter(Boolean);
   let lastError = null;
   for (const candidate of candidates) {

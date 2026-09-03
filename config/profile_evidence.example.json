@@ -1,19 +1,7 @@
 {
   "schema_version": 1,
-  "sources": [
-    {
-      "id": "resume",
-      "path": "/absolute/path/to/resume.pdf",
-      "sha256": "REPLACE_WITH_SHA256"
-    }
-  ],
+  "sources": [],
   "experience_years_min": 0,
   "target_levels": [],
-  "facts": [
-    {
-      "id": "verified-fact-id",
-      "evidence": "Only add a statement supported by the source file.",
-      "match_terms": []
-    }
-  ]
+  "facts": []
 }

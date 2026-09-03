@@ -10,10 +10,11 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import yaml from 'js-yaml';
 
 const MODULE_DIR = dirname(fileURLToPath(import.meta.url));
 const STAGING_ROOT = resolve(MODULE_DIR, '..');
-const DEFAULT_PROJECT_ROOT = process.env.CAREER_OPS_PROJECT_ROOT || '';
+const DEFAULT_PROJECT_ROOT = process.env.CAREER_OPS_PROJECT_ROOT || join(STAGING_ROOT, 'engine');
 
 function clean(value, maxLength = 1000) {
   if (typeof value !== 'string') return '';
@@ -60,9 +61,14 @@ export function eligibleDirectOffers(payload) {
 }
 
 async function loadProductionModules(projectRoot) {
-  const scan = await import(pathToFileURL(join(projectRoot, 'scan.mjs')).href);
-  const yamlModule = await import(pathToFileURL(join(projectRoot, 'node_modules', 'js-yaml', 'index.js')).href);
-  return { scan, yaml: yamlModule.default || yamlModule };
+  const previousCwd = process.cwd();
+  process.chdir(projectRoot);
+  try {
+    const scan = await import(pathToFileURL(join(projectRoot, 'scan.mjs')).href);
+    return { scan, yaml };
+  } finally {
+    process.chdir(previousCwd);
+  }
 }
 
 function parseArgs(argv) {

@@ -1,0 +1,29 @@
+# Local source and filtering policy. No sources or personal preferences are preselected.
+tracked_companies:
+  - name: Wanted
+    provider: wanted
+    enabled: false
+    searchKeywords: []
+    locationKeys: []
+  - name: Saramin
+    provider: saramin
+    enabled: false
+    searchKeywords: []
+  - name: Remember
+    provider: remember
+    enabled: false
+    searchKeywords: []
+  - name: JobKorea
+    provider: jobkorea
+    enabled: false
+    searchKeywords: []
+search_queries: []
+title_filter:
+  positive: []
+  negative: []
+location_filter:
+  positive: []
+  negative: []
+company_aliases: {}
+scan_history:
+  recheck_after_days: 7

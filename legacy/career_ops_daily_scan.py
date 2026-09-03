@@ -30,9 +30,9 @@ from pathlib import Path
 from typing import Any
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-PROJECT_ROOT_SETTING = os.environ.get("CAREER_OPS_PROJECT_ROOT", "").strip()
+PROJECT_ROOT_SETTING = os.environ.get("CAREER_OPS_PROJECT_ROOT", str(REPOSITORY_ROOT / "engine")).strip()
 PROJECT_ROOT = Path(
-    PROJECT_ROOT_SETTING or REPOSITORY_ROOT.parent / "career-ops"
+    PROJECT_ROOT_SETTING or REPOSITORY_ROOT / "engine"
 ).expanduser()
 EXPECTED_PROJECT_ROOT = os.environ.get("CAREER_OPS_EXPECTED_PROJECT_ROOT", "").strip()
 RUN_ID = os.environ.get("CAREER_OPS_RUN_ID", "").strip()
@@ -53,7 +53,7 @@ def validate_project_root() -> dict[str, Any]:
             "expected_project_root": EXPECTED_PROJECT_ROOT or None,
             "root_verified": False,
             "missing_sentinels": [],
-            "error": "Set CAREER_OPS_PROJECT_ROOT to a separately installed Career-Ops directory",
+            "error": "Run npm run setup to initialize the bundled engine",
         }
     try:
         actual = PROJECT_ROOT.resolve(strict=True)
@@ -138,7 +138,7 @@ MAX_DECISION_TEXT_CHARS = 800
 MAX_ERROR_CHARS = 500
 LINKEDIN_FETCH_SCRIPT = Path(
     os.environ.get("CAREER_OPS_LEGACY_LINKEDIN_FETCH")
-    or Path.home() / ".hermes" / "scripts" / "linkedin_site_search_fetch.py"
+    or REPOSITORY_ROOT / "legacy" / "linkedin_site_search_fetch.py"
 )
 LINKEDIN_INGEST_SCRIPT = PROJECT_ROOT / "linkedin-search-ingest.mjs"
 
@@ -533,17 +533,10 @@ def run_mail_audit() -> dict[str, Any]:
         }
 
 
-def _hermes_python() -> Path | None:
-    """Resolve the Python interpreter used by the installed Hermes CLI."""
-    hermes = shutil.which("hermes")
-    if not hermes:
-        return None
-    bin_dir = Path(hermes).resolve().parent
-    for name in ("python", "python3"):
-        candidate = bin_dir / name
-        if candidate.is_file():
-            return candidate
-    return None
+def _runtime_python() -> Path | None:
+    """Use the configured interpreter; collection does not require Hermes."""
+    candidate = Path(os.environ.get("CAREER_OPS_PYTHON") or sys.executable)
+    return candidate if candidate.is_file() else None
 
 
 def run_linkedin_site_search() -> dict[str, Any]:
@@ -556,13 +549,13 @@ def run_linkedin_site_search() -> dict[str, Any]:
         "results_received": 0,
         "ingest": {},
     }
-    hermes_python = _hermes_python()
+    hermes_python = _runtime_python()
     if hermes_python is None:
         return {
             **base,
             "status": "unavailable",
             "elapsed_seconds": 0,
-            "error": "Hermes Python interpreter not found",
+            "error": "Configured Python interpreter not found",
         }
     for label, script in (
         ("LinkedIn search fetch", LINKEDIN_FETCH_SCRIPT),

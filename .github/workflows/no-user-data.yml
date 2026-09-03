@@ -21,24 +21,36 @@ jobs:
               '.gitignore',
               'README.md',
               'package.json',
+              'package-lock.json',
+              'requirements.txt',
               'entrypoint.py',
+              'scripts/cli.mjs',
+              'scripts/setup.py',
+              'config/portals.example.yml',
+              'config/profile.example.yml',
               'config/runtime.example.json',
               'config/linkedin_queries.example.json',
               'config/profile_evidence.example.json',
               'legacy/career_ops_daily_scan.py',
+              'legacy/linkedin_site_search_fetch.py',
               'src/career_ops_daily_v2.py',
               'src/linkedin_direct_fetch.mjs',
               'src/linkedin_direct_ingest.mjs',
               'src/slack_report.py',
               'src/source_liveness.mjs',
             ]);
+            const bundledCode = /^engine\/(?:providers\/|plugins\/|lib\/)?[a-zA-Z0-9_-]+\.(?:mjs|js)$/;
+            const bundledMetadata = new Set(['engine/LICENSE', 'engine/templates/states.yml', 'engine/tracker-aliases.json']);
+            const excluded = /(^|\/)(?:tests?|fixtures?|__tests__|__mocks__)(\/|[-_.])|\.(?:test|spec)\.|(^|\/)test[-_]/;
+            const permitted = file => !excluded.test(file)
+              && (allowed.has(file) || bundledMetadata.has(file) || bundledCode.test(file));
             const files = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
               pull_number: context.payload.pull_request.number,
               per_page: 100,
             });
             const blocked = files
-              .filter(file => file.status !== 'removed' && !allowed.has(file.filename))
+              .filter(file => file.status !== 'removed' && !permitted(file.filename))
               .map(file => file.filename);
             if (blocked.length) {
               core.setFailed('Files outside the reviewed public source boundary:\n' + blocked.join('\n'));

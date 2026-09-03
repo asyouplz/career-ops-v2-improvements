@@ -25,11 +25,23 @@ staging/
 **/.env.*
 !**/.env.example
 
-# The original project belongs outside this extension repository.
+# Do not reintroduce full upstream checkouts alongside the bundled runtime.
 /test-project/
 /career-ops/
 /upstream/
 /vendor/
+
+.venv/
+.venv-*/
+/engine/data/
+/engine/reports/
+/engine/output/
+/engine/batch/
+/engine/config/
+/engine/cv.md
+/engine/portals.yml
+/engine/plugins.local/
+/engine/plugins.lock
 
 # Private source documents and runtime records
 /data/
