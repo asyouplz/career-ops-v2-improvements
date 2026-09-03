@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "queries": [],
+  "allowed_locations": [],
+  "positive_title_terms": [],
+  "scope_override_title_terms": [],
+  "scope_override_excluded_terms": [],
+  "priority_terms": [],
+  "excluded_title_terms": [],
+  "profile_fit": {
+    "preferred_title_terms": [],
+    "secondary_title_terms": [],
+    "deprioritized_title_terms": []
+  },
+  "limits": {
+    "max_queries": 3,
+    "max_cards_per_query": 25,
+    "max_detail_pages": 1,
+    "description_chars": 1800,
+    "navigation_timeout_ms": 30000,
+    "settle_ms": 1200
+  }
+}

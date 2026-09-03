@@ -1,0 +1,45 @@
+name: Public source boundary
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  source-boundary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            // Add new public source paths only after reviewing their contents.
+            const allowed = new Set([
+              '.github/workflows/no-user-data.yml',
+              '.gitignore',
+              'README.md',
+              'package.json',
+              'entrypoint.py',
+              'config/runtime.example.json',
+              'config/linkedin_queries.example.json',
+              'config/profile_evidence.example.json',
+              'legacy/career_ops_daily_scan.py',
+              'src/career_ops_daily_v2.py',
+              'src/linkedin_direct_fetch.mjs',
+              'src/linkedin_direct_ingest.mjs',
+              'src/slack_report.py',
+              'src/source_liveness.mjs',
+            ]);
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const blocked = files
+              .filter(file => file.status !== 'removed' && !allowed.has(file.filename))
+              .map(file => file.filename);
+            if (blocked.length) {
+              core.setFailed('Files outside the reviewed public source boundary:\n' + blocked.join('\n'));
+            }

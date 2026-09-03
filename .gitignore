@@ -1,0 +1,64 @@
+# Generated output and caches
+artifacts*/
+backup-*/
+**/__pycache__/
+**/*.pyc
+**/.pytest_cache/
+**/node_modules/
+.DS_Store
+
+# Local runtime configuration and personal career evidence
+config/runtime.json
+config/runtime-bootstrap-apply.json
+config/profile_evidence.json
+config/linkedin_queries.json
+
+# Production deployment records contain live cron, Slack, execution, and host IDs.
+# They remain in the local working copy but are intentionally not versioned.
+staging/
+
+# Environment files and credentials
+.env
+.env.*
+!.env.example
+**/.env
+**/.env.*
+!**/.env.example
+
+# The original project belongs outside this extension repository.
+/test-project/
+/career-ops/
+/upstream/
+/vendor/
+
+# Private source documents and runtime records
+/data/
+/reports/
+/output/
+/jds/
+/interview-prep/
+/writing-samples/
+/cv.md
+/article-digest.md
+/portals.yml
+/config/profile.yml
+/config/cv-facts.json
+/config/plugins.yml
+/modes/_profile.md
+/modes/_custom.md
+/modes/_brief.md
+/.mcp.json
+/plugins.local/
+/plugins.lock
+
+# No testing or demonstration artifacts are distributed.
+**/tests/
+**/test/
+**/fixtures/
+**/__tests__/
+**/__mocks__/
+**/*.test.*
+**/*.spec.*
+**/test_*.py
+**/*_test.go
+**/demo.gif
