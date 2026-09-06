@@ -40,6 +40,7 @@ CLOSURE_STATUS_LABELS = {
     "error": "확인 필요",
     "disabled": "비활성",
 }
+SLACK_MAX_MESSAGE_CHARS = 40_000
 
 
 class SlackDeliveryError(RuntimeError):
@@ -52,14 +53,17 @@ def _text(value: Any, limit: int = 1000) -> str:
 
 
 def _safe_url(value: Any) -> str | None:
-    raw = "".join(str(value or "").split())
+    raw = str(value or "")
+    # Reject malformed links instead of silently rewriting a candidate's identity.
+    if not raw or any(char.isspace() or char in "|<>" for char in raw):
+        return None
     try:
         parsed = urlparse(raw)
     except ValueError:
         return None
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
-    return raw.replace("|", "%7C").replace("<", "%3C").replace(">", "%3E")
+    return raw
 
 
 def _report_date(value: Any) -> str:
@@ -75,8 +79,20 @@ def _status_count(status: dict[str, Any], name: str) -> int:
     return int((counts or {}).get(name, 0) or 0)
 
 
+def _profile_fit_text(candidate: dict[str, Any], *, limit: int) -> str:
+    match = candidate.get("profile_match")
+    if isinstance(match, dict):
+        rationale = match.get("rationale")
+        if isinstance(rationale, str) and rationale.strip():
+            return "이력 연관: " + _text(rationale, limit)
+    evidence_ids = candidate.get("profile_evidence_ids")
+    if isinstance(evidence_ids, list) and evidence_ids:
+        return f"이력 관련 항목 {len(evidence_ids)}개"
+    return ""
+
+
 def _candidate_lines(
-    payload: dict[str, Any], *, max_candidates: int = 5
+    payload: dict[str, Any], *, max_candidates: int = 5, detail_level: int = 2
 ) -> tuple[list[str], list[str]]:
     lines: list[str] = []
     rendered_urls: list[str] = []
@@ -106,6 +122,13 @@ def _candidate_lines(
         score = _text(candidate.get("evaluation_score_text"), 20)
         evidence = " · ".join(item for item in (score, source, origin) if item)
         lines.append(f"{eligible_index}. <{url}|*{company} — {role}*>")
+        if detail_level <= 0:
+            if candidate.get("profile_review_required"):
+                lines.append("   연차·직급 확인 필요")
+            rendered_urls.append(url)
+            if eligible_index >= max(0, int(max_candidates)):
+                break
+            continue
         posting_date = _text(candidate.get("posting_date"), 20)
         first_seen = _text(candidate.get("first_seen"), 20)
         date_evidence = (
@@ -120,9 +143,13 @@ def _candidate_lines(
             if candidate.get("profile_review_required")
             else "지원 검토 권고"
         )
-        details = " · ".join(
-            item for item in (location, date_evidence, evidence, review_label) if item
+        fit = _profile_fit_text(candidate, limit=100 if detail_level >= 2 else 70)
+        parts = (
+            (location, date_evidence, evidence, review_label, fit)
+            if detail_level >= 2
+            else (score, source, review_label, fit)
         )
+        details = " · ".join(item for item in parts if item)
         lines.append(f"   {details}")
         rendered_urls.append(url)
         if eligible_index >= max(0, int(max_candidates)):
@@ -202,7 +229,6 @@ def _render_root(
     status = payload.get("application_status") or {}
     active = [item for item in (status.get("active") or []) if isinstance(item, dict)]
     preview_limit = max(0, min(int(root_active_limit), len(active), 8))
-    candidate_limit = 5
     report_date = _report_date(payload.get("generated_at"))
     no_response_closed = int(status.get("no_response_closed_count", 0) or 0)
     other_excluded = status.get("other_excluded_count")
@@ -214,15 +240,20 @@ def _render_root(
         )
     other_excluded = max(0, int(other_excluded or 0))
 
-    def compose(active_limit: int, job_limit: int) -> tuple[str, list[str]]:
+    def compose(
+        active_limit: int, *, status_detail: int = 2, candidate_detail: int = 2
+    ) -> tuple[str, list[str]]:
         candidates, rendered_urls = _candidate_lines(
-            payload, max_candidates=job_limit
+            payload, max_candidates=5, detail_level=candidate_detail
         )
         lines: list[str] = []
         if prefix:
             lines.extend([f"*{_text(prefix, 160)}*", ""])
         lines.extend([f"*채용 지원 리포트 · {report_date}*", "", "*지원 대상*"])
         lines.extend(candidates or ["오늘 지원 검토 권고 공고 없음"])
+        if status_detail <= 0:
+            lines.extend(["", "_지원 현황과 실행 진단은 댓글 참조._"])
+            return "\n".join(lines), rendered_urls
         lines.extend(
             [
                 "",
@@ -238,11 +269,15 @@ def _render_root(
                 ),
             ]
         )
+        if status_detail <= 1:
+            lines.extend(["", "_전체 지원중 목록과 실행 진단은 댓글 참조._"])
+            return "\n".join(lines), rendered_urls
         if active:
             lines.append("지원중 회사: " + _active_company_summary(active))
         if active:
-            lines.append(f"최근 지원 {min(active_limit, len(active))}건:")
-            lines.extend(_active_line(item) for item in active[:active_limit])
+            if active_limit:
+                lines.append(f"최근 지원 {min(active_limit, len(active))}건:")
+                lines.extend(_active_line(item) for item in active[:active_limit])
             remaining = max(
                 0,
                 int(status.get("active_count", len(active)) or 0) - active_limit,
@@ -254,16 +289,23 @@ def _render_root(
         lines.extend(["", "_상태변경 상세와 오늘 실행 진단은 댓글로 분리했습니다._"])
         return "\n".join(lines), rendered_urls
 
-    root, rendered_urls = compose(preview_limit, candidate_limit)
-    while len(root) > root_max_chars and preview_limit > 0:
+    # The configurable root length is a presentation hint. Candidate count and
+    # exact links are preserved even when their core lines exceed that hint.
+    soft_limit = max(0, min(int(root_max_chars), SLACK_MAX_MESSAGE_CHARS))
+    root, rendered_urls = compose(preview_limit)
+    while len(root) > soft_limit and preview_limit > 0:
         preview_limit -= 1
-        root, rendered_urls = compose(preview_limit, candidate_limit)
-    while len(root) > root_max_chars and candidate_limit > 0:
-        candidate_limit -= 1
-        root, rendered_urls = compose(preview_limit, candidate_limit)
-    if len(root) > root_max_chars:
+        root, rendered_urls = compose(preview_limit)
+    if len(root) > soft_limit:
+        root, rendered_urls = compose(0, status_detail=1)
+    if len(root) > soft_limit:
+        root, rendered_urls = compose(0, status_detail=1, candidate_detail=1)
+    if len(root) > soft_limit:
+        root, rendered_urls = compose(0, status_detail=0, candidate_detail=0)
+    if len(root) > SLACK_MAX_MESSAGE_CHARS:
         raise ValueError(
-            f"Slack root exceeds {root_max_chars} characters after bounding: {len(root)}"
+            f"Slack root exceeds {SLACK_MAX_MESSAGE_CHARS} characters with candidate "
+            f"identities and links preserved: {len(root)}"
         )
     return root, rendered_urls
 
@@ -564,6 +606,12 @@ def deliver_slack_bundle(
         raise ValueError("Slack root target must be slack:<channel_id> without a thread ID")
     if not hermes_bin.is_file() and runner is subprocess.run:
         raise ValueError(f"Hermes executable unavailable: {hermes_bin}")
+    messages = [bundle.get("root"), *(bundle.get("thread_replies") or [])]
+    for index, message in enumerate(messages):
+        if len(str(message or "")) > SLACK_MAX_MESSAGE_CHARS:
+            raise ValueError(
+                f"Slack message {index} exceeds {SLACK_MAX_MESSAGE_CHARS} characters"
+            )
     root_result = _send(
         hermes_bin=hermes_bin,
         target=target,

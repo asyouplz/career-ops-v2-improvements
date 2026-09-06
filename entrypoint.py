@@ -207,6 +207,15 @@ def main() -> None:
         root_max_chars=int(slack_delivery.get("root_max_chars") or 2400),
         prefix=os.environ.get("CAREER_OPS_V2_SLACK_PREFIX") or None,
     )
+    expected_urls = [
+        str(candidate.get("url") or "")
+        for candidate in payload.get("candidates") or []
+        if isinstance(candidate, dict)
+        and candidate.get("recommendation_eligible") is True
+        and candidate.get("liveness") == "active"
+    ][:5]
+    if bundle.get("rendered_candidate_urls") != expected_urls:
+        raise RuntimeError("Slack report did not preserve the selected recommendation URLs")
     delivery = deliver_slack_bundle(
         bundle,
         hermes_bin=Path(slack_delivery["hermes_bin"]),
@@ -230,6 +239,10 @@ def main() -> None:
                 "schema_version": "career-ops-v2.slack-delivery.v1",
                 "generated_at": datetime.now(UTC).isoformat(timespec="seconds"),
                 "bundle_lengths": bundle["lengths"],
+                "recommendation_counts": {
+                    "selected": len(expected_urls),
+                    "rendered": len(bundle["rendered_candidate_urls"]),
+                },
                 "source_artifact": existing_artifact or None,
                 "delivery": delivery,
             },
