@@ -34,6 +34,7 @@ jobs:
               'legacy/career_ops_daily_scan.py',
               'legacy/linkedin_site_search_fetch.py',
               'src/career_ops_daily_v2.py',
+              'src/recommendation_ranking.py',
               'src/linkedin_direct_fetch.mjs',
               'src/linkedin_direct_ingest.mjs',
               'src/slack_report.py',

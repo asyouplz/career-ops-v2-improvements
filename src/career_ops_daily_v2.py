@@ -27,6 +27,11 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
+from recommendation_ranking import (
+    assess_profile_fit as _assess_profile_fit,
+    candidate_fit_sort_key,
+)
+
 
 MODULE_DIR = Path(__file__).resolve().parent
 STAGING_ROOT = MODULE_DIR.parent
@@ -1356,24 +1361,12 @@ def apply_liveness_results(
             item["verification_method"] = "active-recommendation-cooldown"
         item.update(_actionability(item))
         updated.append(item)
-    updated.sort(
-        key=lambda item: (
-            0 if item.get("recommendation_eligible") else 1,
-            0 if not item.get("recommendation_cooldown") else 1,
-            0 if int(item.get("freshness_ordinal") or 0) else 1,
-            -int(item.get("freshness_ordinal") or 0),
-            -int(item.get("profile_fit_score") or 0),
-            -int(item.get("actionability_score") or 0),
-            -float(item.get("evaluation_score") or 0),
-            0 if item.get("direct_verified") and item.get("liveness") == "active" else 1,
-            0 if item.get("liveness") == "active" else 1,
-            -int(item.get("priority_score") or 0),
-            str(item.get("company") or "").casefold(),
-        )
-    )
-    # Source diversity remains useful when building the larger pre-check pool,
-    # but the final bounded list must preserve evidence and actionability order.
-    return updated[: max(1, min(limit, 5))]
+    # The report contains only currently verified, history-eligible candidates.
+    # Do not fill a short list with unverified or cooling-down postings.
+    eligible = [item for item in updated if item.get("recommendation_eligible")]
+    eligible.sort(key=candidate_fit_sort_key)
+    return eligible[: max(1, min(limit, 5))]
+
 
 
 def _source_round_robin(
@@ -3504,29 +3497,13 @@ def _candidate_score(candidate: dict[str, Any], config: dict[str, Any]) -> int:
     return score
 
 
-def assess_profile_fit(candidate: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Use title evidence as a soft rank signal, never as an exclusion gate."""
-    title = _clean(candidate.get("title"), 300).casefold()
-    policy = config.get("profile_fit") or {}
-    leadership = [term for term in policy.get("preferred_title_terms", []) if _contains(title, [term])]
-    senior = [term for term in policy.get("secondary_title_terms", []) if _contains(title, [term])]
-    entry = [term for term in policy.get("deprioritized_title_terms", []) if _contains(title, [term])]
-    score = (3 if leadership else 0) + (1 if senior else 0) - (3 if entry else 0)
-    reasons: list[str] = []
-    if leadership:
-        reasons.append("preferred_title")
-    if senior:
-        reasons.append("secondary_title")
-    if entry:
-        reasons.append("deprioritized_title")
-    review_required = bool(entry) or not bool(leadership)
-    if review_required:
-        reasons.append("title_only_seniority_uncertain")
-    return {
-        "profile_fit_score": score,
-        "profile_fit_reasons": reasons,
-        "profile_review_required": review_required,
-    }
+def assess_profile_fit(
+    candidate: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Rank against verified career evidence before selecting any shortlist."""
+    return _assess_profile_fit(candidate, config or {}, profile)
 
 
 def verified_direct_records(candidates: Any) -> list[dict[str, Any]]:
@@ -3549,6 +3526,7 @@ def select_candidates(
     limit: int,
     tracker: dict[str, Any] | None = None,
     history_gate_stats: dict[str, Any] | None = None,
+    profile: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
@@ -3643,7 +3621,7 @@ def select_candidates(
                 bool(identity.get("location_eligible")) if identity is not None else True
             ),
         }
-        candidate.update(assess_profile_fit(candidate, config))
+        candidate.update(assess_profile_fit(candidate, config, profile))
         decision = (
             {
                 "history_gate": identity.get("history_gate", "eligible"),
@@ -3660,26 +3638,14 @@ def select_candidates(
         selected.append(candidate)
     selected.sort(
         key=lambda item: (
-            0 if not item.get("recommendation_cooldown") else 1,
-            0 if int(item.get("freshness_ordinal") or 0) else 1,
-            -int(item.get("freshness_ordinal") or 0),
-            -int(item.get("profile_fit_score") or 0),
-            0 if item.get("direct_verified") else 1,
-            0 if float(item.get("evaluation_score") or 0) else 1,
-            -float(item.get("evaluation_score") or 0),
-            0 if item.get("last_liveness_checked_epoch") is None else 1,
-            int(item.get("last_liveness_checked_epoch") or 0),
-            -int(item["priority_score"]),
-            int(item["pipeline_order"]) if isinstance(item.get("pipeline_order"), int) else 1_000_000_000,
-            item["company"].casefold(),
-            item["title"].casefold(),
+            bool(item.get("recommendation_cooldown")),
+            *candidate_fit_sort_key(item),
         )
     )
-    # The pre-verification pool may be larger than the five candidates exposed
-    # to the agent. This lets a closed first result fall through to another
-    # candidate from the same source without increasing prompt size.
+    # Fit is compared before every count limit, regardless of source.
+    # Verification can inspect more candidates than the final five.
     bounded_limit = max(1, min(limit, 100))
-    return _source_round_robin(selected, bounded_limit)
+    return selected[:bounded_limit]
 
 
 def prioritize_non_cooldown(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3991,180 +3957,44 @@ def _compact_encoded_size(payload: dict[str, Any]) -> int:
     )
 
 
-def _bound_compact_payload(payload: dict[str, Any], max_bytes: int) -> int:
-    """Remove optional detail in stages while preserving decisions and counts.
+def _bound_compact_payload(
+    payload: dict[str, Any],
+    max_bytes: int | None = None,
+    *,
+    max_candidates: int = 5,
+) -> int:
+    """Bound report records by count; byte size is diagnostic only.
 
-    Reconciliation actions, candidate identity/URL/liveness fields, aggregate
-    counts, and the history-gate decision counts are never dropped.
-    Additional passes bound large mail/profile/source diagnostics without
-    increasing prompt size.
+    Keep the legacy max_bytes argument for callers with older configuration.
+    It never removes recommendations or fails an otherwise valid report.
+    Exact tracker actions and aggregate counts are preserved.
     """
-
-    def encoded_size() -> int:
-        return _compact_encoded_size(payload)
-
-    size = encoded_size()
-    if size <= max_bytes:
-        return size
-
-    candidates = payload.get("candidates") or []
-    mail_audit = payload.get("mail_audit") or {}
-    mail_messages = mail_audit.get("messages") or []
-    collector = payload.get("collector") or {}
-    history_gate = payload.get("history_gate") or {}
-    profile = payload.get("profile_evidence") or {}
-    linkedin = payload.get("linkedin") or {}
-    liveness = payload.get("liveness") or {}
-    application_status = payload.get("application_status") or {}
-    no_response = payload.get("no_response_closure") or {}
-    file_audit = payload.get("file_audit") or {}
-
-    for candidate in candidates:
-        candidate["description"] = _clean(candidate.get("description"), 500)
-    size = encoded_size()
-
-    if size > max_bytes:
-        mail_audit["messages"] = mail_messages[:7]
-        mail_audit["messages_truncated"] = len(mail_messages) > 7
-        for candidate in candidates:
-            candidate["description"] = _clean(candidate.get("description"), 180)
-        size = encoded_size()
-    if size > max_bytes:
-        active = application_status.get("active") or []
-        application_status["active"] = active[:20]
-        application_status["active_truncated"] = (
-            bool(application_status.get("active_truncated")) or len(active) > 20
-        )
-        size = encoded_size()
-    if size > max_bytes:
-        mail_audit["messages"] = (mail_audit.get("messages") or [])[:5]
-        size = encoded_size()
-    if size > max_bytes and no_response.get("actions"):
-        active = application_status.get("active") or []
-        application_status["active"] = active[:10]
-        application_status["active_truncated"] = (
-            bool(application_status.get("active_truncated")) or len(active) > 10
-        )
-        size = encoded_size()
-    if size > max_bytes:
-        for candidate in payload.get("candidates") or []:
-            candidate["description"] = _clean(candidate.get("description"), 240)
-        collector["new_offer_preview"] = (collector.get("new_offer_preview") or [])[:3]
-        size = encoded_size()
-
-    # Preserve aggregate mail counts and exact reconciliation actions, but
-    # reduce repeated message evidence that is not required for a write.
-    if size > max_bytes:
-        bounded_messages = []
-        for item in (mail_audit.get("messages") or [])[:3]:
-            bounded = dict(item)
-            bounded["from"] = _clean(bounded.get("from"), 100)
-            bounded["subject"] = _clean(bounded.get("subject"), 160)
-            bounded["snippet"] = _clean(bounded.get("snippet"), 120)
-            bounded["evidence_company"] = _clean(bounded.get("evidence_company"), 120) or None
-            bounded["evidence_role"] = _clean(bounded.get("evidence_role"), 160) or None
-            bounded["tracker_matches"] = (bounded.get("tracker_matches") or [])[:1]
-            bounded_messages.append(bounded)
-        mail_audit["messages"] = bounded_messages
-        mail_audit["messages_truncated"] = True
-        history_gate["examples"] = (history_gate.get("examples") or [])[:3]
-        profile["facts"] = [
-            {**item, "evidence": _clean(item.get("evidence"), 200)}
-            for item in (profile.get("facts") or [])[:4]
-        ]
-        size = encoded_size()
-
-    if size > max_bytes:
-        for candidate in payload.get("candidates") or []:
-            candidate["description"] = _clean(candidate.get("description"), 120)
-        for item in application_status.get("active") or []:
-            item["company"] = _clean(item.get("company"), 100)
-            item["role"] = _clean(item.get("role"), 140)
-        mail_audit["messages"] = (mail_audit.get("messages") or [])[:2]
-        collector["new_offer_preview"] = (collector.get("new_offer_preview") or [])[:2]
-        linkedin["query_results"] = (linkedin.get("query_results") or [])[:1]
-        history_gate["examples"] = (history_gate.get("examples") or [])[:2]
-        size = encoded_size()
-
-    if size > max_bytes and no_response.get("actions"):
-        active = application_status.get("active") or []
-        application_status["active"] = active[:5]
-        application_status["active_truncated"] = (
-            bool(application_status.get("active_truncated")) or len(active) > 5
-        )
-        size = encoded_size()
-
-    # Last-resort optional-detail removal. Core counts and every exact tracker
-    # action remain, so apply-mode behavior does not become partial or ambiguous.
-    if size > max_bytes:
-        mail_audit["messages"] = []
-        collector["new_offer_preview"] = []
-        collector_summary = collector.get("summary") or {}
-        collector["summary"] = {
-            key: collector_summary[key]
-            for key in (
-                "companies_scanned",
-                "job_boards_scanned",
-                "total_jobs_found",
-                "filtered_by_title",
-                "filtered_by_location",
-                "filtered_by_salary",
-                "filtered_by_content",
-                "duplicates",
-                "new_offers_found",
-                "source_results",
-            )
-            if key in collector_summary
-        }
-        linkedin["query_results"] = []
-        linkedin_filter_stats = linkedin.get("filter_stats") or {}
-        linkedin["filter_stats"] = {
-            _clean(key, 80): value
-            for key, value in list(linkedin_filter_stats.items())[:20]
-            if isinstance(value, (bool, int, float))
-        }
-        liveness["source_results"] = {}
-        (payload.get("pipeline") or {})["source_inventory"] = []
-        history_gate["examples"] = []
-        profile["facts"] = [
-            {**item, "evidence": _clean(item.get("evidence"), 120)}
-            for item in (profile.get("facts") or [])[:2]
-        ]
-        for candidate in payload.get("candidates") or []:
-            candidate["description"] = ""
-        actions = (mail_audit.get("reconciliation") or {}).get("actions") or []
-        for action in actions:
-            action["company"] = _clean(action.get("company"), 40)
-            action["role"] = _clean(action.get("role"), 60)
-            action["evidence_subject"] = _clean(action.get("evidence_subject"), 20)
-        for action in no_response.get("actions") or []:
-            action["company"] = _clean(action.get("company"), 80)
-            action["role"] = _clean(action.get("role"), 120)
-        if isinstance(file_audit, dict) and file_audit:
-            changed_paths = file_audit.get("changed") or []
-            file_audit["changed"] = []
-            file_audit["changed_paths_truncated"] = bool(changed_paths)
-            verification = file_audit.get("verification")
-            if isinstance(verification, dict):
-                verification["summary"] = _clean(verification.get("summary"), 200)
-        size = encoded_size()
-
-    if size > max_bytes:
-        for candidate in payload.get("candidates") or []:
-            candidate["description"] = ""
-            candidate.pop("actionability_reasons", None)
-            candidate.pop("profile_fit_reasons", None)
-            candidate.pop("profile_evidence_ids", None)
-        size = encoded_size()
-
-    # Candidate identity and liveness remain until every optional detail has
-    # been exhausted. Only an unusually small configured budget can reduce the
-    # candidate count, one tail item at a time.
-    while size > max_bytes and payload.get("candidates"):
-        payload["candidates"].pop()
-        size = encoded_size()
-
-    return size
+    limit = max(1, min(int(max_candidates), 5))
+    candidates = [item for item in payload.get("candidates") or []
+                  if isinstance(item, dict)]
+    payload["candidates"] = candidates[:limit]
+    payload["recommendation_selection"] = {
+        "limit_kind": "count",
+        "requested_count": limit,
+        "selected_count": len(payload["candidates"]),
+        "ranking": "verified_profile_fit",
+    }
+    # Ancillary previews have independent record limits. They cannot consume
+    # recommendation slots, regardless of their UTF-8 encoded length.
+    for section, key, count in (
+        ("mail_audit", "messages", 7),
+        ("collector", "new_offer_preview", 5),
+        ("linkedin", "query_results", 3),
+        ("history_gate", "examples", 3),
+        ("profile_evidence", "facts", 8),
+    ):
+        value = payload.get(section)
+        if isinstance(value, dict) and isinstance(value.get(key), list):
+            records = value[key]
+            value[key] = records[:count]
+            if len(records) > count:
+                value[f"{key}_truncated"] = True
+    return _compact_encoded_size(payload)
 
 
 def build_compact_payload(
@@ -4179,7 +4009,8 @@ def build_compact_payload(
     pipeline: dict[str, Any],
     profile: dict[str, Any],
     candidates: list[dict[str, Any]],
-    max_bytes: int,
+    max_bytes: int | None = None,
+    max_candidates: int = 5,
     history_gate: dict[str, Any] | None = None,
     application_status: dict[str, Any] | None = None,
     no_response_closure: dict[str, Any] | None = None,
@@ -4410,13 +4241,7 @@ def build_compact_payload(
     if any(status in {"error", "timeout", "partial"} for status in statuses):
         payload["overall_status"] = "partial"
 
-    # Reserve room for the protected-file audit appended by main().
-    initial_budget = max(1024, max_bytes - 1024)
-    size = _bound_compact_payload(payload, initial_budget)
-    if size > initial_budget:
-        raise ValueError(
-            f"Compact payload core exceeds {initial_budget} byte pre-audit budget: {size}"
-        )
+    size = _bound_compact_payload(payload, max_candidates=max_candidates)
     return payload, size
 
 
@@ -4657,13 +4482,9 @@ def main(argv: list[str] | None = None) -> int:
         max_candidates,
         int(runtime.get("max_liveness_checks") or max_candidates),
     )
-    max_processed_candidates = max(
-        0,
-        min(
-            int(runtime.get("max_processed_candidates") or 4),
-            max_liveness_checks,
-        ),
-    )
+    # Existing evaluations compete for the same verification budget as new
+    # postings. The former four-item origin cap could hide the fifth best fit.
+    max_processed_candidates = max_liveness_checks
     max_linkedin_rechecks = max(
         0,
         min(int(runtime.get("max_linkedin_rechecks") or 1), 2),
@@ -4694,6 +4515,7 @@ def main(argv: list[str] | None = None) -> int:
         limit=max_candidates,
         tracker=tracker,
         history_gate_stats=history_gate_stats,
+        profile=profile,
     )
     # A historical LinkedIn row does not carry the direct-page evidence used by
     # V2. It may re-enter only when the current direct collector finds it again.
@@ -4711,6 +4533,7 @@ def main(argv: list[str] | None = None) -> int:
         limit=max_processed_candidates,
         tracker=tracker,
         history_gate_stats=history_gate_stats,
+        profile=profile,
     ) if max_processed_candidates else []
     # LinkedIn is already covered by the bounded direct-page path. Do not spend
     # generic liveness slots on inherited LinkedIn rows that cannot establish
@@ -4736,6 +4559,7 @@ def main(argv: list[str] | None = None) -> int:
         limit=max_linkedin_rechecks,
         tracker=tracker,
         history_gate_stats=history_gate_stats,
+        profile=profile,
     ) if max_linkedin_rechecks else []
     pipeline_candidates = select_candidates(
         [],
@@ -4744,19 +4568,21 @@ def main(argv: list[str] | None = None) -> int:
         limit=max_liveness_checks,
         tracker=tracker,
         history_gate_stats=history_gate_stats,
+        profile=profile,
     )
     preliminary_candidates: list[dict[str, Any]] = []
     seen_candidate_instances: set[str] = set()
     seen_candidate_clusters: set[str] = set()
-    # Fresh direct and pending records consume the bounded liveness budget
-    # before older Processed evaluations. Recommendation cooldown and explicit
-    # posted/first-seen dates keep yesterday's result from crowding out a new one.
-    ordered_candidates = prioritize_non_cooldown([
-        *direct_candidates,
-        *selected_linkedin_rechecks,
-        *pipeline_candidates,
-        *processed_candidates,
-    ])
+    # Compare fit across origins before spending the verification budget.
+    # A good existing evaluation must not wait behind every new pending row.
+    ordered_candidates = sorted(
+        [*direct_candidates, *selected_linkedin_rechecks,
+         *pipeline_candidates, *processed_candidates],
+        key=lambda item: (
+            bool(item.get("recommendation_cooldown")),
+            *candidate_fit_sort_key(item),
+        ),
+    )
     for candidate in ordered_candidates:
         instance_key = str(candidate.get("listing_instance_id") or candidate.get("url") or "")
         cluster_key = str(
@@ -4783,7 +4609,6 @@ def main(argv: list[str] | None = None) -> int:
         liveness,
         limit=max_candidates,
     )
-    candidates = attach_profile_matches(candidates, profile)
     compact, compact_bytes = build_compact_payload(
         mode=mode,
         mail=mail,
@@ -4797,7 +4622,7 @@ def main(argv: list[str] | None = None) -> int:
         candidates=candidates,
         application_status=application_status,
         no_response_closure=no_response_closure,
-        max_bytes=int(runtime.get("max_compact_payload_bytes") or 10000),
+        max_candidates=max_candidates,
         history_gate=history_gate_stats,
         identity=identity,
     )
@@ -4819,13 +4644,8 @@ def main(argv: list[str] | None = None) -> int:
     elif mode == "apply" and not file_audit.get("integrity_verified"):
         compact["overall_status"] = "partial"
     compact_bytes = _bound_compact_payload(
-        compact,
-        int(runtime.get("max_compact_payload_bytes") or 10000),
+        compact, max_candidates=max_candidates,
     )
-    if compact_bytes > int(runtime.get("max_compact_payload_bytes") or 10000):
-        raise ValueError(
-            f"Compact payload exceeds configured limit after protection result: {compact_bytes}"
-        )
 
     diagnostic = {
         "schema_version": "career-ops-v2.diagnostic.v1",
