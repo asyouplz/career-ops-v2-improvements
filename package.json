@@ -10,6 +10,13 @@
     "scan": "node scripts/cli.mjs scan",
     "verify": "node scripts/cli.mjs verify",
     "tracker": "node scripts/cli.mjs tracker",
+    "dashboard:install": "npm --prefix dashboard/web ci --ignore-scripts",
+    "dashboard:build": "npm --prefix dashboard/web run build",
+    "dashboard:password": "node scripts/cli.mjs dashboard-password",
+    "dashboard": "node scripts/cli.mjs dashboard",
+    "mail:auth": "node scripts/cli.mjs mail-auth",
+    "mail:sync": "node scripts/cli.mjs mail-sync",
+    "mail:timing": "node scripts/cli.mjs mail-timing",
     "browser:install": "playwright install chromium"
   },
   "dependencies": {

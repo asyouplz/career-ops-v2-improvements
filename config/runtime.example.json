@@ -11,7 +11,7 @@
   "collector_timeout_seconds": 300,
   "include_mail_in_dry_run": false,
   "include_collector_in_dry_run": false,
-  "enable_no_response_closure": true,
+  "enable_no_response_closure": false,
   "no_response_close_days": 60,
   "no_response_close_max_per_run": 20,
   "identity_resolver_script": "identity-resolver.mjs",
@@ -30,5 +30,7 @@
     "root_active_preview_limit": 5,
     "root_max_chars": 2400
   },
-  "protected_files": []
+  "protected_files": [],
+  "enable_dashboard_mail_sync": false,
+  "dashboard_mail_sync_timeout_seconds": 1800
 }
