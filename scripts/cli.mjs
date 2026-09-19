@@ -32,8 +32,18 @@ if (command === 'setup') {
     executable = python;
     parameters = [join(root, 'src', 'career_ops_daily_v2.py'), '--mode', 'dry-run',
       ...(command === 'preview' ? ['--skip-network'] : ['--include-collector']), ...args];
+  } else if (command === 'dashboard' || command === 'dashboard-password') {
+    executable = python;
+    parameters = [join(root, 'dashboard', 'run.py'),
+      ...(command === 'dashboard-password' ? ['--set-password'] : []), ...args];
+  } else if (['mail-auth', 'mail-sync', 'mail-timing'].includes(command)) {
+    executable = python;
+    const mail = join(root, 'dashboard', 'backend', 'mail-sync');
+    parameters = command === 'mail-auth' ? [join(mail, 'gmail_auth.py'), ...args]
+      : command === 'mail-sync' ? [join(mail, 'worker.py'), '--project-root', engine, ...args]
+      : [join(mail, 'timing_report.py'), '--data-dir', process.env.DASHBOARD_DATA_DIR || join(engine, 'data'), ...args];
   } else {
-    throw new Error('Command must be setup, run, preview, scan, verify, or tracker');
+    throw new Error('Unknown command. See the repository README for available commands.');
   }
 }
 const engine = resolve(root, runtime.production_project_root || 'engine');
@@ -45,6 +55,8 @@ const result = spawnSync(executable, parameters, {
     PATH: [dirname(process.execPath), process.env.PATH || ''].join(process.platform === 'win32' ? ';' : ':'),
     CAREER_OPS_PROJECT_ROOT: engine,
     CAREER_OPS_EXPECTED_PROJECT_ROOT: engine,
+    CAREER_OPS_ROOT: process.env.CAREER_OPS_ROOT || engine,
+    DASHBOARD_NODE: process.env.DASHBOARD_NODE || process.execPath,
     CAREER_OPS_PYTHON: python,
   },
 });

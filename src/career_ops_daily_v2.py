@@ -27,6 +27,10 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
+from dashboard_pipeline import (
+    build_export, canonical_job_url, dashboard_liveness, decision_path, export_path, filter_decisions, load_decisions, write_export,
+)
+
 from recommendation_ranking import (
     assess_profile_fit as _assess_profile_fit,
     candidate_fit_sort_key,
@@ -60,6 +64,8 @@ HISTORY_HARD_BLOCK_STATUSES = {
     "offer",
     "rejected",
     "discarded",
+    "skip",
+    "hired",
 }
 HISTORY_COMPANY_BLOCK_STATUSES = {
     "applied",
@@ -659,6 +665,79 @@ def run_legacy_component(runtime: dict[str, Any], flag: str) -> dict[str, Any]:
     payload["process_elapsed_seconds"] = result["elapsed_seconds"]
     if result["status"] != "ok":
         payload["process_error"] = _command_error(result, f"legacy {flag} failed")
+    return payload
+
+
+def run_dashboard_mail_sync(runtime: dict[str, Any], *, mode: str, artifact_dir: Path) -> dict[str, Any]:
+    """One canonical Gmail writer, completed before ranking/status reconciliation."""
+    root = Path(runtime['production_project_root']).expanduser().resolve()
+    environment = runtime_subprocess_env(runtime)
+    configured_data = environment.get('DASHBOARD_DATA_DIR')
+    if configured_data is not None:
+        # The scheduled pipeline reads decisions, the mail ledger and tracker
+        # from this project's data directory. Do not let its worker write to a
+        # different dashboard store and then reconcile against the wrong one.
+        try:
+            data_matches = Path(configured_data).expanduser().resolve() == (root / 'data').resolve()
+        except (OSError, RuntimeError, ValueError):
+            data_matches = False
+        if not data_matches:
+            return {
+                'status': 'error', 'dashboard_sync': True, 'source': 'codex-gmail-readonly',
+                'messages': [], 'message_count': 0,
+                'error_code': 'dashboard-data-directory-mismatch',
+                'error': '정기 실행은 프로젝트의 기본 data 폴더만 지원합니다. 대시보드 데이터 폴더 설정을 일치시킨 뒤 다시 실행해 주세요.',
+            }
+        # A relative environment value was resolved in the caller's directory;
+        # preserve that identity when the subprocess changes its working directory.
+        environment['DASHBOARD_DATA_DIR'] = str((root / 'data').resolve())
+    backend = STAGING_ROOT / 'dashboard' / 'backend'
+    configured = runtime.get('dashboard_mail_sync_command')
+    command = list(configured) if isinstance(configured, list) else [
+        str(runtime.get('python_bin') or sys.executable), str(backend / 'mail-sync' / 'worker.py'),
+        '--project-root', str(root),
+        '--ingest-script', str(backend / 'mail_store.py'),
+    ]
+    if not command or any(not isinstance(value, str) for value in command):
+        return {'status': 'error', 'dashboard_sync': True, 'source': 'codex-gmail-readonly',
+                'messages': [], 'error': 'Invalid dashboard mail sync command'}
+    command = [value for value in command if value != '--apply']
+    if mode == 'apply': command.append('--apply')
+    else: command += ['--work-dir', str(artifact_dir.resolve() / 'mail-preview')]
+    result = _run(command, cwd=root, timeout=int(runtime.get('dashboard_mail_sync_timeout_seconds') or 1800),
+                  env=environment)
+    try:
+        summary = _parse_last_json(result.get('stdout') or '')
+    except Exception:
+        summary = {'ok': False, 'errors': ['Mail synchronization did not return a valid summary']}
+    complete = bool(summary.get('ok') and summary.get('complete') and result.get('status') == 'ok')
+    # An overlapping dashboard run is not a complete audit. Preserve no-response
+    # safety and report pending/error instead of treating partial mail as empty.
+    payload = {'status': 'ok' if complete else 'error', 'source': 'codex-gmail-readonly',
+               'dashboard_sync': True, 'lookback_days': 7, 'messages': [], 'message_count': 0,
+               'synchronization': summary, 'elapsed_seconds': result.get('elapsed_seconds', 0),
+               'error': None if complete else '메일 동기화가 완료되지 않았습니다. 기존 상태를 유지합니다.'}
+    if not complete: return payload
+    try:
+        bundle = _json_load(Path(summary['bundle_path']))
+        ledger_path = root / 'data' / 'dashboard-mail-ledger.json'
+        ledger = _json_load(ledger_path) if ledger_path.is_file() else {}
+        ledger_events = ledger.get('events', {})
+        for event in bundle.get('events', []):
+            stored = ledger_events.get(event.get('event_id'), {})
+            tracker_id = stored.get('tracker_id') or event.get('tracker_id')
+            payload['messages'].append({
+                'message_id': event.get('message_id'), 'thread_id': event.get('thread_id'),
+                'date': event.get('event_at'), 'from': '',
+                'subject': '[' + str(event.get('company') or '') + '] ' + str(event.get('role') or ''),
+                'snippet': event.get('evidence_text', ''), 'decision_text': event.get('evidence_text', ''),
+                'dashboard_tracker_id': str(tracker_id) if tracker_id is not None else None,
+            })
+        payload['message_count'] = len(payload['messages'])
+        payload['reconciliation'] = {'apply_result': {'status': 'ok', 'mode': mode,
+            'applied_count': summary.get('applied_count', 0), 'failed_count': 0}, 'actions': []}
+    except Exception:
+        payload.update(status='error', error='Completed mail synchronization bundle could not be verified')
     return payload
 
 
@@ -1309,7 +1388,8 @@ def apply_liveness_results(
     candidates: list[dict[str, Any]],
     liveness: dict[str, Any],
     *,
-    limit: int,
+    limit: int | None = 5,
+    include_cooldown: bool = False,
 ) -> list[dict[str, Any]]:
     mapping = liveness.get("results") if isinstance(liveness.get("results"), dict) else {}
     checker_sources = (
@@ -1356,6 +1436,7 @@ def apply_liveness_results(
         else:
             item["verification_method"] = "not-verified"
             item["recommendation_eligible"] = False
+        item["dashboard_eligible"] = bool(item.get("recommendation_eligible"))
         if item.get("recommendation_eligible") and item.get("recommendation_cooldown"):
             item["recommendation_eligible"] = False
             item["verification_method"] = "active-recommendation-cooldown"
@@ -1363,9 +1444,9 @@ def apply_liveness_results(
         updated.append(item)
     # The report contains only currently verified, history-eligible candidates.
     # Do not fill a short list with unverified or cooling-down postings.
-    eligible = [item for item in updated if item.get("recommendation_eligible")]
+    eligible = [item for item in updated if item.get("dashboard_eligible" if include_cooldown else "recommendation_eligible")]
     eligible.sort(key=candidate_fit_sort_key)
-    return eligible[: max(1, min(limit, 5))]
+    return eligible if limit is None else eligible[: max(1, min(limit, 5))]
 
 
 
@@ -2161,6 +2242,18 @@ def _roles_match(left: Any, right: Any) -> bool:
     return len(shorter) >= 8 and shorter in longer and len(shorter) / len(longer) >= 0.72
 
 
+def _skip_matches(candidate: dict[str, Any], entry: dict[str, Any]) -> bool:
+    """A user's exclusion follows a concrete posting/full role, never fuzzy roles."""
+    role = lambda value: re.sub(r'\s+', '', unicodedata.normalize('NFKC', str(value or ''))).casefold()
+    target = canonical_job_url(candidate.get('url') or '')
+    urls = [entry.get('url') or ''] + re.findall(r'https?://[^\s<>\]\)]+', str(entry.get('notes') or ''))
+    concrete = [canonical_job_url(url) for url in urls if re.search(r'(?:/wd/\d+|/job(?:-posting|/posting)/\d+|rec_idx=\d+|GI_Read/\d+|/jobs/view/\d+)', url, re.I)]
+    if target and target in concrete: return True
+    if not role(candidate.get('title')) or role(candidate.get('title')) != role(entry.get('role')): return False
+    if target and any(urlparse(old).hostname == urlparse(target).hostname and old != target for old in concrete): return False
+    return True
+
+
 def _history_decision(
     candidate: dict[str, Any],
     tracker: dict[str, Any] | None,
@@ -2187,7 +2280,8 @@ def _history_decision(
     same_role = [
         entry
         for entry in company_matches
-        if _roles_match(candidate.get("title"), entry.get("role"))
+        if (_skip_matches(candidate, entry) if str(entry.get('status') or '').casefold() == 'skip'
+            else _roles_match(candidate.get("title"), entry.get("role")))
     ]
 
     for entry in same_role:
@@ -3239,6 +3333,8 @@ def _recent_mail_tracker_ids(
             # allowing genuinely old messages to be excluded from protection.
             if message_time is not None and message_time < cutoff:
                 continue
+        if audit.get('dashboard_sync') and str(message.get('dashboard_tracker_id') or '').isdigit():
+            protected.add(str(message['dashboard_tracker_id']))
         for match in message.get("tracker_matches") or []:
             if not isinstance(match, dict):
                 continue
@@ -3301,6 +3397,14 @@ def apply_no_response_closures(
         "failures": [],
         "tracker_synced": False,
     }
+    # The dashboard workflow keeps actual applications in progress while the
+    # company has not replied. Only evidence of a real outcome can move them.
+    # Preserve the historical housekeeping policy solely for the legacy path.
+    if audit.get("dashboard_sync"):
+        result["status"] = "disabled"
+        result["enabled"] = False
+        result["reason"] = "지원 후 상대 답변 대기는 지원현황에 유지합니다."
+        return result
     if not enabled:
         result["status"] = "disabled"
         return result
@@ -3523,7 +3627,7 @@ def select_candidates(
     pipeline_candidates: list[dict[str, Any]],
     config: dict[str, Any],
     *,
-    limit: int,
+    limit: int | None,
     tracker: dict[str, Any] | None = None,
     history_gate_stats: dict[str, Any] | None = None,
     profile: dict[str, Any] | None = None,
@@ -3571,9 +3675,10 @@ def select_candidates(
             if not _contains(location, config.get("allowed_locations") or []):
                 continue
             role_key = (company.casefold(), title.casefold())
-        if url in seen_urls or role_key in seen_roles:
+        concrete_url = canonical_job_url(url) or url
+        if concrete_url in seen_urls:
             continue
-        seen_urls.add(url)
+        seen_urls.add(concrete_url)
         seen_roles.add(role_key)
         source = classify_job_source(url)
         try:
@@ -3609,6 +3714,8 @@ def select_candidates(
             "recommendation_cooldown_until": _clean(
                 raw.get("_recommendation_cooldown_until"), 80
             ) or None,
+            "verified_at": raw.get("verified_at"),
+            "tracker_matches": (identity or {}).get("tracker_matches") or [],
             "company_key": _clean((identity or {}).get("company_key"), 200) or None,
             "role_key": _clean((identity or {}).get("role_key"), 300) or None,
             "posting_cluster_id": _clean(
@@ -3644,6 +3751,8 @@ def select_candidates(
     )
     # Fit is compared before every count limit, regardless of source.
     # Verification can inspect more candidates than the final five.
+    if limit is None:
+        return selected
     bounded_limit = max(1, min(limit, 100))
     return selected[:bounded_limit]
 
@@ -4291,12 +4400,16 @@ def main(argv: list[str] | None = None) -> int:
     include_mail = bool(
         supplied_mail is not None
         or args.include_mail
-        or mode == "apply"
+        or (mode == "apply" and runtime.get("enable_dashboard_mail_sync", False))
         or runtime.get("include_mail_in_dry_run")
     )
     include_collector = bool(
         args.include_collector or mode == "apply" or runtime.get("include_collector_in_dry_run")
     )
+    if include_mail and supplied_mail is None:
+        # The worker uses the same lock/ledger as manual dashboard synchronization.
+        # No legacy mail writer runs alongside it.
+        supplied_mail = run_dashboard_mail_sync(runtime, mode=mode, artifact_dir=args.artifact_dir)
     worker_count = 1 + int(include_mail and supplied_mail is None) + int(include_collector)
     with ThreadPoolExecutor(max_workers=worker_count) as executor:
         direct_future = executor.submit(
@@ -4412,17 +4525,19 @@ def main(argv: list[str] | None = None) -> int:
         mail,
         [raw_direct_candidates, raw_processed_candidates, raw_pipeline_candidates],
     )
-    mail = attach_tracker_matches(mail, tracker)
-    apply_same_run_mail_history_blocks(
-        mail,
-        [raw_direct_candidates, raw_processed_candidates, raw_pipeline_candidates],
-    )
-    apply_mail_reconciliation_actions(
-        mail,
-        project_root=project_root,
-        node_bin=Path(runtime["node_bin"]),
-        mode=mode,
-    )
+    if not _mail_audit_object(mail).get('dashboard_sync'):
+        mail = attach_tracker_matches(mail, tracker)
+        apply_same_run_mail_history_blocks(
+            mail,
+            [raw_direct_candidates, raw_processed_candidates, raw_pipeline_candidates],
+        )
+    if not _mail_audit_object(mail).get('dashboard_sync'):
+        apply_mail_reconciliation_actions(
+            mail,
+            project_root=project_root,
+            node_bin=Path(runtime["node_bin"]),
+            mode=mode,
+        )
     review_queue_setting = runtime.get("mail_review_queue_path")
     review_queue_path = (
         Path(str(review_queue_setting))
@@ -4431,11 +4546,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     if not review_queue_path.is_absolute():
         review_queue_path = project_root / review_queue_path
-    update_mail_review_queue(
-        mail,
-        queue_path=review_queue_path,
-        mode=mode,
-    )
+    if not _mail_audit_object(mail).get('dashboard_sync'):
+        update_mail_review_queue(
+            mail,
+            queue_path=review_queue_path,
+            mode=mode,
+        )
     # Explicit mail evidence always runs first. Re-read the canonical tracker
     # before considering no-response closure so a same-run rejection,
     # interview, response, or offer cannot be overwritten by the age rule.
@@ -4508,11 +4624,22 @@ def main(argv: list[str] | None = None) -> int:
             "days": recommendation_cooldown_days,
         },
     }
+    dashboard_decisions = load_decisions(decision_path(runtime))
+    # Keep user-held postings available for an immediate restore in the
+    # dashboard. They never enter the recommendation or live-check budget.
+    # Canonical application-history exclusions still apply in select_candidates.
+    dashboard_pool = select_candidates(
+        [], [*raw_direct_candidates, *raw_processed_candidates, *raw_pipeline_candidates],
+        linkedin_config, limit=None, tracker=tracker, profile=profile,
+    )
+    raw_direct_candidates = filter_decisions(raw_direct_candidates, dashboard_decisions)
+    raw_processed_candidates = filter_decisions(raw_processed_candidates, dashboard_decisions)
+    raw_pipeline_candidates = filter_decisions(raw_pipeline_candidates, dashboard_decisions)
     direct_candidates = select_candidates(
-        verified_direct_records(direct.get("candidates")),
+        verified_direct_records(raw_direct_candidates),
         [],
         linkedin_config,
-        limit=max_candidates,
+        limit=None,
         tracker=tracker,
         history_gate_stats=history_gate_stats,
         profile=profile,
@@ -4530,7 +4657,7 @@ def main(argv: list[str] | None = None) -> int:
         [],
         non_linkedin_processed,
         linkedin_config,
-        limit=max_processed_candidates,
+        limit=None,
         tracker=tracker,
         history_gate_stats=history_gate_stats,
         profile=profile,
@@ -4565,7 +4692,7 @@ def main(argv: list[str] | None = None) -> int:
         [],
         non_linkedin_pipeline,
         linkedin_config,
-        limit=max_liveness_checks,
+        limit=None,
         tracker=tracker,
         history_gate_stats=history_gate_stats,
         profile=profile,
@@ -4584,19 +4711,19 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     for candidate in ordered_candidates:
-        instance_key = str(candidate.get("listing_instance_id") or candidate.get("url") or "")
+        instance_key = str(canonical_job_url(candidate.get("url")) or candidate.get("listing_instance_id") or candidate.get("url") or "")
         cluster_key = str(
             candidate.get("posting_cluster_id")
             or f"{candidate.get('company')}::{candidate.get('title')}"
         )
-        if instance_key in seen_candidate_instances or cluster_key in seen_candidate_clusters:
+        if instance_key in seen_candidate_instances:
             continue
         seen_candidate_instances.add(instance_key)
         seen_candidate_clusters.add(cluster_key)
         preliminary_candidates.append(candidate)
     liveness = run_liveness_precheck(
         runtime,
-        preliminary_candidates,
+        _source_round_robin(preliminary_candidates, len(preliminary_candidates)),
         max_checks=max_liveness_checks,
         skip_network=args.skip_network,
     )
@@ -4604,11 +4731,25 @@ def main(argv: list[str] | None = None) -> int:
         **persist_liveness_state(runtime, liveness, mode=mode),
         **liveness_state_stats,
     }
-    candidates = apply_liveness_results(
-        preliminary_candidates,
-        liveness,
-        limit=max_candidates,
+    # Re-read decisions after network checks: a dashboard action taken during
+    # this run must not consume a report slot or reappear in its Slack result.
+    preliminary_candidates = filter_decisions(
+        preliminary_candidates, load_decisions(decision_path(runtime)),
     )
+    candidates = apply_liveness_results(preliminary_candidates, liveness, limit=max_candidates)
+    dashboard_evidence = dashboard_liveness(
+        dashboard_pool, liveness,
+        load_liveness_state(_liveness_state_path(runtime)),
+        checked_at=datetime.now(UTC).isoformat(timespec="seconds"),
+    )
+    dashboard_candidates = apply_liveness_results(
+        dashboard_pool, dashboard_evidence, limit=None, include_cooldown=True,
+    )
+    verified_urls = {item.get("url") for item in dashboard_candidates}
+    dashboard_reserve = [
+        {**item, "liveness": (dashboard_evidence.get("results") or {}).get(item.get("url"), item.get("liveness")), "dashboard_eligible": False}
+        for item in dashboard_pool if item.get("url") not in verified_urls
+    ]
     compact, compact_bytes = build_compact_payload(
         mode=mode,
         mail=mail,
@@ -4702,6 +4843,13 @@ def main(argv: list[str] | None = None) -> int:
         json.dumps(diagnostic, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
+
+    if mode == "apply" and compact.get("overall_status") != "error":
+        write_export(export_path(runtime), build_export(
+            dashboard_candidates, tracker, pipeline,
+            source_run_at=diagnostic["started_at"], source_artifact=str(diagnostic_path),
+            mode=mode, reserve=dashboard_reserve,
+        ))
 
     print(json.dumps(compact, ensure_ascii=False, separators=(",", ":")))
     if mode == "dry-run" and changed:

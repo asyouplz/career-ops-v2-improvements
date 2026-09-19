@@ -10,6 +10,7 @@ backup-*/
 # Local runtime configuration and personal career evidence
 config/runtime.json
 config/runtime-bootstrap-apply.json
+config/dashboard.json
 config/profile_evidence.json
 config/linkedin_queries.json
 
@@ -74,3 +75,19 @@ staging/
 **/test_*.py
 **/*_test.go
 **/demo.gif
+
+# Private dashboard deployments and mail evidence never belong in source control.
+dashboard/web/dist/
+dashboard/web/.next/
+dashboard/web/.wrangler/
+dashboard/**/.private/
+dashboard/**/revisions/
+dashboard/**/deploy/
+dashboard/**/data/
+dashboard/**/backups/
+dashboard/**/gmail-accounts/
+dashboard/**/mail-thread-cache/
+dashboard/**/provider-diagnostics/
+dashboard/**/gmail.json
+dashboard/**/client_secret*.json
+dashboard/**/token*.json

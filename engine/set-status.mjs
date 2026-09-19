@@ -52,7 +52,8 @@
  * Exit codes: 0 success (including no-op re-runs) · 1 usage error,
  * non-canonical state, unreadable states.yml, or non-retryable lock/write failure ·
  * 2 row not found or unreadable tracker · 3 ambiguous company match ·
- * 4 tracker lock timeout (busy — retry later).
+ * 4 tracker lock timeout (busy — retry later) ·
+ * 5 optional expected revision/status conflict (refresh before retrying).
  *
  * When the new status is Applied, the JSON output carries
  * `"followupSeedCandidate": true` — the hook point for seeding
@@ -70,6 +71,7 @@
 import { readFileSync, existsSync, appendFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
 import { extractTrackerReportNumbers, resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 import { roleFuzzyMatch } from './role-matcher.mjs';
 import {
@@ -83,6 +85,8 @@ const STATES_FILE = join(CAREER_OPS, 'templates/states.yml');
 // LOCK_TIMEOUT is not destructured here — that exit path is raised inside
 // acquireTrackerLockForCli() itself (tracker-utils.mjs), via CLI_EXIT.LOCK_TIMEOUT.
 const { OK: EXIT_OK, USAGE: EXIT_USAGE, NOT_FOUND: EXIT_NOT_FOUND, AMBIGUOUS: EXIT_AMBIGUOUS } = CLI_EXIT;
+// Opt-in optimistic concurrency; existing callers retain their exit contract.
+const EXIT_CONFLICT = 5;
 
 const USAGE = `Usage: node set-status.mjs <report#|company> <state> [--note "..."] [--role "..."] [--on YYYY-MM-DD] [--force] [--dry-run] [--json]
        node set-status.mjs --row N <state> [...]        (explicit tracker row ID)
@@ -100,6 +104,9 @@ const USAGE = `Usage: node set-status.mjs <report#|company> <state> [--note "...
                      report-less row whose number another row claims as its report link
   --dry-run          Resolve and validate, but write nothing
   --json             Machine-readable output on stdout (errors included)
+  --expected-revision SHA256  Require the exact row revision (UTF-8 raw line,
+                             excluding LF or CRLF); checked inside the write lock
+  --expected-status State     Require this canonical old status inside the lock
 
   Tracker row IDs and report IDs are separate counters that diverge permanently
   once any row exists without a report. Prefer --row/--report (or the company
@@ -109,8 +116,8 @@ const USAGE = `Usage: node set-status.mjs <report#|company> <state> [--note "...
 
 const rawArgs = process.argv.slice(2);
 const positional = [];
-const flags = { note: null, role: null, on: null, row: null, report: null, force: false, dryRun: false, json: false };
-const VALUE_FLAGS = { '--note': 'note', '--role': 'role', '--on': 'on', '--row': 'row', '--report': 'report' };
+const flags = { note: null, role: null, on: null, row: null, report: null, expectedRevision: null, expectedStatus: null, force: false, dryRun: false, json: false };
+const VALUE_FLAGS = { '--note': 'note', '--role': 'role', '--on': 'on', '--row': 'row', '--report': 'report', '--expected-revision': 'expectedRevision', '--expected-status': 'expectedStatus' };
 
 for (let i = 0; i < rawArgs.length; i++) {
   const a = rawArgs[i];
@@ -211,6 +218,13 @@ const newStatus = resolveCanonicalState(stateInput, states);
 if (!newStatus) {
   const valid = states.map(s => s.label).join(' · ');
   failWith(EXIT_USAGE, 'invalid-state', `"${stateInput}" is not a canonical state. Valid states: ${valid}`);
+}
+if (flags.expectedRevision !== null && !/^[a-f0-9]{64}$/i.test(flags.expectedRevision)) {
+  failWith(EXIT_USAGE, 'invalid-revision', '--expected-revision must be a SHA-256 hexadecimal digest');
+}
+const expectedStatus = flags.expectedStatus === null ? null : resolveCanonicalState(flags.expectedStatus, states);
+if (flags.expectedStatus !== null && !expectedStatus) {
+  failWith(EXIT_USAGE, 'invalid-state', '--expected-status must be a canonical state');
 }
 
 // ── tracker access ───────────────────────────────────────────────
@@ -341,6 +355,17 @@ if (rows.length === 0) {
 }
 
 const target = resolveRow(rows);
+
+// The tracker was read after acquiring its shared writer lock. Checking here
+// makes a web snapshot's compare-and-swap cover cron/CLI writers as well as
+// other browser clients. Dry-run is only a preview; the real call rechecks.
+const currentRevision = createHash('sha256').update(target.raw.replace(/\r$/, ''), 'utf8').digest('hex');
+if (flags.expectedRevision !== null && flags.expectedRevision.toLowerCase() !== currentRevision) {
+  failWith(EXIT_CONFLICT, 'revision-conflict', 'Tracker row changed since it was read; refresh before retrying');
+}
+if (expectedStatus !== null && target.status !== expectedStatus) {
+  failWith(EXIT_CONFLICT, 'status-conflict', 'Tracker status changed since it was read; refresh before retrying');
+}
 
 // A BARE numeric selector is often copied from a report filename. If the row ID
 // disagrees with its local report link, silently updating that row can affect

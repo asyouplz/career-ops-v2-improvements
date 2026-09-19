@@ -24,7 +24,7 @@ import { roleFuzzyMatch } from './role-matcher.mjs';
 import { normalizeTextKey } from './tracker-parse.mjs';
 
 const HARD_BLOCK_STATUSES = new Set([
-  'applied', 'responded', 'interview', 'offer', 'rejected', 'discarded',
+  'applied', 'responded', 'interview', 'offer', 'rejected', 'discarded', 'skip', 'hired',
 ]);
 const COMPANY_BLOCK_STATUSES = new Set([
   'applied', 'responded', 'interview', 'offer', 'rejected',
@@ -36,6 +36,26 @@ function digest(prefix, value) {
 
 function clean(value, limit = 1000) {
   return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, limit);
+}
+
+function exactRole(value) {
+  return clean(value).normalize('NFKC').replace(/\s+/g, '').toLowerCase();
+}
+
+function postingUrls(item) {
+  const values = [item.url, ...(String(item.notes || '').match(/https?:\/\/[^\s<>\]\)]+/g) || [])];
+  return values.filter(value => value && /(?:\/wd\/\d+|\/job(?:-posting|\/posting)\/\d+|rec_idx=\d+|GI_Read\/\d+|\/jobs\/view\/\d+)/i.test(value)).map(value => normalizeUrlForDedup(value) || value);
+}
+
+function skipMatches(role, item, url) {
+  const target = normalizeUrlForDedup(url) || url;
+  if (item.posting_urls.includes(target)) return true;
+  if (!exactRole(role) || exactRole(role) !== exactRole(item.role)) return false;
+  if (target && item.posting_urls.some(old => {
+    try { return new URL(old).hostname === new URL(target).hostname && old !== target; }
+    catch { return false; }
+  })) return false;
+  return true;
 }
 
 function readStdin() {
@@ -70,6 +90,7 @@ export function resolveIdentityBatch(payload, portalsConfig = {}) {
       status: clean(item.status, 40),
       company_key: canonicalizeCompany(item.company),
       role_key: normalizeRoleForIdentity(item.role),
+      posting_urls: postingUrls(item),
     }));
 
   const results = records
@@ -93,7 +114,7 @@ export function resolveIdentityBatch(payload, portalsConfig = {}) {
       const rankedMatches = companyMatches
         .map(item => ({
           ...item,
-          role_match: Boolean(
+          role_match: item.status.toLowerCase() === 'skip' ? skipMatches(role, item, url) : Boolean(
             roleKey && item.role_key
             && (roleKey === item.role_key || roleFuzzyMatch(role, item.role))
           ),

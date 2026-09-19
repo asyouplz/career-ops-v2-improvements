@@ -56,6 +56,10 @@ def main() -> int:
     create_local("engine/data/applications.md", "# Applications\n\n| # | Date | Company | Role | Score | Status | PDF | Report | Notes |\n|---|------|---------|------|-------|--------|-----|--------|-------|\n")
     create_local("engine/data/pipeline.md", "# Pipeline\n\n## Pending\n\n## Processed\n\n")
     create_local("engine/data/scan-history.tsv", "date\turl\tcompany\ttitle\tresult\n")
+    create_local("engine/data/dashboard-candidates.json", json.dumps({
+        "version": 1, "generated_at": None, "source_run_at": None,
+        "jobs": [], "sources": [],
+    }, ensure_ascii=False, indent=2) + "\n")
     for directory in ("engine/reports", "engine/batch/tracker-additions", "artifacts"):
         (ROOT / directory).mkdir(parents=True, exist_ok=True)
     print("Ready. Add your own sources and filters in engine/portals.yml. Fresh settings disable mail and Slack; existing settings were preserved.")

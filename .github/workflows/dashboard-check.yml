@@ -1,0 +1,39 @@
+name: Dashboard build and startup
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  standalone-dashboard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            dashboard/web/package-lock.json
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - run: npm ci --ignore-scripts
+      - run: python -m pip install -r requirements.txt
+      - run: npm run setup
+      - run: npm run dashboard:install
+      - run: npm --prefix dashboard/web run lint
+      - run: npm --prefix dashboard/web run typecheck
+      - run: npm run dashboard:build
+      - run: python -m compileall -q dashboard/backend dashboard/run.py src/dashboard_pipeline.py src/dashboard_bootstrap.py
+      - run: npm run tracker -- sync --check
+      - run: npm run preview
+      - run: npm run dashboard -- --check
+        env:
+          DASHBOARD_DEV_NO_AUTH: '1'
+          DASHBOARD_PUBLIC_ORIGIN: http://127.0.0.1:9121

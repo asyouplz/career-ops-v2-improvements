@@ -17,6 +17,7 @@
 import { readFileSync, readdirSync, mkdirSync, renameSync, existsSync } from 'fs';
 import { join, basename, dirname } from 'path';
 import { fileURLToPath } from 'url';
+import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { normalizeReportLink as normalizeLink } from './tracker-links.mjs';
 import { roleFuzzyMatch } from './role-matcher.mjs';
@@ -575,10 +576,29 @@ function parseTsvContent(content, filename) {
 
 // Read applications.md
 if (!existsSync(APPS_FILE)) {
+  if (process.env.CAREER_OPS_EXPECTED_TRACKER_SHA256 !== undefined) {
+    console.error('tracker-revision-conflict: tracker no longer exists; refresh before retrying');
+    process.exit(5);
+  }
   console.log('No applications.md found. Nothing to merge into.');
   process.exit(0);
 }
-const appContent = readFileSync(APPS_FILE, 'utf-8');
+const appBytes = readFileSync(APPS_FILE);
+// Optional dashboard compare-and-swap: the exact tracker bytes must still
+// match the preflight snapshot after this process acquires the shared lock.
+// Without the environment variable, existing cron/CLI behavior is unchanged.
+const expectedTrackerHash = process.env.CAREER_OPS_EXPECTED_TRACKER_SHA256;
+if (expectedTrackerHash !== undefined) {
+  if (!/^[a-f0-9]{64}$/i.test(expectedTrackerHash)) {
+    console.error('Invalid CAREER_OPS_EXPECTED_TRACKER_SHA256: expected a SHA-256 hex digest');
+    process.exit(1);
+  }
+  if (createHash('sha256').update(appBytes).digest('hex') !== expectedTrackerHash.toLowerCase()) {
+    console.error('tracker-revision-conflict: tracker changed since preflight; refresh before retrying');
+    process.exit(5);
+  }
+}
+const appContent = appBytes.toString('utf-8');
 // Test-only synchronization hook: the concurrent merge test waits for the
 // first worker to read the tracker while still holding the lock, then starts a
 // second worker to prove the lock prevents the old lost-update race.
