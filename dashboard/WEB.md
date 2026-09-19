@@ -41,6 +41,34 @@ npm --prefix dashboard/web run lint
 npm --prefix dashboard/web run typecheck
 ```
 
+## 화면 스타일 토큰
+
+`web/app/globals.css` 상단에 색상·타이포·간격·반경·그림자를 CSS 변수로 정의합니다.
+개별 규칙에서 색상값을 직접 쓰지 않고 이 변수를 참조합니다. 새 화면 요소를 추가할 때도
+같은 변수를 사용하면 라이트·다크 두 상태가 함께 반영됩니다.
+
+- 표면: `--surface-page`, `--surface-card`, `--surface-subtle`, `--surface-inset`,
+  `--surface-accent`, `--surface-hover`, `--surface-inverse`
+- 선: `--line`, `--line-soft`, `--line-strong`
+- 글자: `--text-strong`, `--text-body`, `--text-muted`, `--text-subtle`, `--text-faint`
+- 강조: 채움은 `--brand`, 밝은 배경 위의 글자·아이콘은 `--brand-text`
+- 상태: `--warn-*`, `--danger-*`, `--success-text`, `--neutral-surface`
+- 크기: `--fs-3xs`~`--fs-3xl`, `--sp-1`~`--sp-10`, `--r-xs`~`--r-pill`,
+  `--shadow-sm`~`--shadow-xl`
+- 조작 요소 최소 높이: `--tap-min`. 700px 이하에서는 `--tap-touch`(44px)로 바뀝니다.
+
+다크 모드는 `@media (prefers-color-scheme: dark)`에서 같은 변수를 다시 정의하는 방식이며,
+운영체제 설정을 따릅니다. 화면 안에 별도 전환 버튼은 두지 않았습니다. `:root`의
+`color-scheme` 값도 함께 바꾸므로 기본 select·스크롤막대도 같은 상태를 따릅니다.
+`@theme inline`이 shadcn 변수(`--background`, `--primary` 등)를 위 토큰에 연결하므로
+Tailwind 유틸리티와 공용 컴포넌트도 같은 값을 사용합니다.
+
+본문·보조 글자와 배경 조합은 WCAG 2.1 AA 기준(일반 텍스트 4.5:1)을 확인해 정했습니다.
+색상값을 바꿀 때는 이 대비를 함께 확인합니다.
+
+공개 안내 페이지(`web/public/career-info.css`)는 같은 팔레트를 `--info-*` 이름으로
+따로 정의합니다. 대시보드 색상을 바꾸면 이 파일도 함께 확인해야 두 화면이 일치합니다.
+
 ## 화면에서 지원하는 동작
 
 - 추천·지원현황·지원보류·지원제외를 각각 표시합니다. 보류·제외는 최근 5개, 출처 필터와 더보기를 제공합니다.
