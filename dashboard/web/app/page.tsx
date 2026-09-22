@@ -96,20 +96,6 @@ const date = (value?: string, withTime = false) => {
     timeZone: 'Asia/Seoul',
   }).format(d);
 };
-// "09. 22. (화) 09:40" — used for the collection time in the page header.
-const runLabel = (value?: string) => {
-  const d = new Date(value || '');
-  if (Number.isNaN(d.getTime())) return '';
-  return new Intl.DateTimeFormat('ko-KR', {
-    month: '2-digit',
-    day: '2-digit',
-    weekday: 'short',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-    timeZone: 'Asia/Seoul',
-  }).format(d);
-};
 const clockTime = (value?: string) => {
   const d = new Date(value || '');
   if (Number.isNaN(d.getTime())) return '';
@@ -117,6 +103,22 @@ const clockTime = (value?: string) => {
     hour: '2-digit',
     minute: '2-digit',
     hour12: false,
+    timeZone: 'Asia/Seoul',
+  }).format(d);
+};
+// "오늘" / "어제" / "9월 20일" for the collection date, in Seoul time.
+const dayLabel = (value?: string) => {
+  const d = new Date(value || '');
+  if (Number.isNaN(d.getTime())) return '';
+  const key = (x: Date) =>
+    new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul' }).format(x);
+  const today = new Date();
+  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+  if (key(d) === key(today)) return '오늘';
+  if (key(d) === key(yesterday)) return '어제';
+  return new Intl.DateTimeFormat('ko-KR', {
+    month: 'long',
+    day: 'numeric',
     timeZone: 'Asia/Seoul',
   }).format(d);
 };
@@ -603,6 +605,10 @@ export default function Page() {
     (n, s) => n + s.jobs.filter((j) => isNewJob(j, data?.source_run_at)).length,
     0,
   );
+  const sitesWithJobs = knownSites.filter((s) => s.jobs.length).length;
+  const interviews = applications.filter(
+    (j) => j.canonical_status === 'Interview',
+  ).length;
   const shownJobs = shownSites.reduce(
     (n, s) => n + s.jobs.filter(matches).length,
     0,
@@ -725,23 +731,57 @@ export default function Page() {
           <main className="main" id="main-content" tabIndex={-1}>
             <section className="page-head" aria-labelledby="page-title">
               <h1 id="page-title">오늘의 검토</h1>
-              <p className="freshness">
-                {data?.source_run_at ? (
-                  <>
-                    <span>{runLabel(data.source_run_at)} 수집</span>
-                    <span>추천 {recommended}건</span>
-                    {newCount > 0 && (
-                      <span className="fresh-new">새로 발견 {newCount}건</span>
-                    )}
-                  </>
-                ) : (
-                  <span>
-                    {data
-                      ? '아직 수집 결과가 없습니다'
-                      : '최근 수집 결과를 불러오고 있습니다'}
-                  </span>
-                )}
-              </p>
+              <dl className="today-summary">
+                <div
+                  className={`summary-cell${data?.stale ? ' is-stale' : ''}`}
+                >
+                  <dt>최근 수집</dt>
+                  <dd className="summary-value">
+                    {data?.source_run_at ? clockTime(data.source_run_at) : '–'}
+                  </dd>
+                  <dd className="summary-sub">
+                    {!data
+                      ? '불러오는 중'
+                      : !data.source_run_at
+                        ? '수집 기록 없음'
+                        : data.stale
+                          ? '수집 지연'
+                          : `${dayLabel(data.source_run_at)} 수집`}
+                  </dd>
+                </div>
+                <div className="summary-cell">
+                  <dt>추천</dt>
+                  <dd className="summary-value">
+                    {data ? `${recommended}건` : '–'}
+                  </dd>
+                  <dd className="summary-sub">
+                    {data ? `사이트 ${sitesWithJobs}곳` : ''}
+                  </dd>
+                </div>
+                <div className={`summary-cell${newCount ? ' is-new' : ''}`}>
+                  <dt>새로 발견</dt>
+                  <dd className="summary-value">
+                    {data ? `${newCount}건` : '–'}
+                  </dd>
+                  <dd className="summary-sub">최근 24시간</dd>
+                </div>
+                <div className="summary-cell">
+                  <dt>
+                    <span className="label-long">진행 중 지원</span>
+                    <span className="label-short">진행 중</span>
+                  </dt>
+                  <dd className="summary-value">
+                    {data ? `${active.length}건` : '–'}
+                  </dd>
+                  <dd className="summary-sub">
+                    {!data
+                      ? ''
+                      : interviews
+                        ? `면접 ${interviews}건`
+                        : `전체 ${applications.length}건`}
+                  </dd>
+                </div>
+              </dl>
             </section>
             {error && (
               <div role="alert" className="alert error-alert">
