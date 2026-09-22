@@ -1050,9 +1050,12 @@ h2 {
   overflow-wrap: anywhere;
 }
 .history-button.compact {
+  /* Same width with or without a mail count, so row actions line up. */
+  min-width: 7.5rem;
   min-height: var(--tap-min);
   margin: 0;
   padding: 0 var(--sp-3);
+  justify-content: flex-start;
 }
 .history-count {
   display: inline-grid;
@@ -2080,6 +2083,7 @@ h2 {
     font-size: var(--fs-sm);
   }
   .history-button.compact {
+    min-width: 0;
     width: var(--tap-touch);
     padding: 0 !important;
     justify-content: center;
