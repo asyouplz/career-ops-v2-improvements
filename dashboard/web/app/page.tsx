@@ -4,13 +4,10 @@ import Link from 'next/link';
 import {
   ArrowUpRight,
   ArrowRight,
-  Bookmark,
-  BriefcaseBusiness,
   Check,
   ChevronDown,
   Clock3,
   Inbox,
-  LayoutGrid,
   LockKeyhole,
   LogOut,
   RefreshCw,
@@ -19,6 +16,8 @@ import {
   Sparkles,
   X,
   Undo2,
+  Bookmark,
+  BriefcaseBusiness,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
@@ -32,19 +31,10 @@ import {
   DialogHeader,
   DialogFooter,
 } from '@/components/ui/dialog';
-import {
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
-} from '@/components/ui/collapsible';
-import {
-  NativeSelect,
-  NativeSelectOption,
-} from '@/components/ui/native-select';
 
 import type { Job, Archive, Dashboard, MoveStatus } from './dashboard-types';
 import { isMovable, canMove, moveNames } from './dashboard-types';
-import { MovementProvider, MoveHandle, DraggableCard } from './job-movement';
+import { MovementProvider, DraggableCard } from './job-movement';
 import { MailSyncBar, JobHistory, HistoryButton } from './mail-panel';
 
 type Session = { authenticated: boolean; csrf_token?: string };
@@ -74,9 +64,27 @@ const stateName: Record<string, string> = {
 const decisionName: Record<Decision, string> = {
   pending: '지원보류',
   excluded: '지원제외',
-  applied: '지원 기록',
+  applied: '지원 완료 기록',
   new: '추천으로 복원',
 };
+// Order used by the stage filter and the status picker in the dialog.
+const applicationStates = [
+  'Applied',
+  'Responded',
+  'Interview',
+  'Offer',
+  'Hired',
+  'Rejected',
+  'Discarded',
+];
+const activeStates = ['Applied', 'Responded', 'Interview', 'Offer'];
+// Colour family for a stage: in progress, positive outcome, or closed.
+const stageTone = (status?: string) =>
+  status === 'Offer' || status === 'Hired'
+    ? 'positive'
+    : status === 'Rejected' || status === 'Discarded'
+      ? 'closed'
+      : 'active';
 const date = (value?: string, withTime = false) => {
   if (!value) return '기록 없음';
   const d = new Date(value);
@@ -85,6 +93,32 @@ const date = (value?: string, withTime = false) => {
     month: '2-digit',
     day: '2-digit',
     ...(withTime ? { hour: '2-digit', minute: '2-digit', hour12: false } : {}),
+    timeZone: 'Asia/Seoul',
+  }).format(d);
+};
+const clockTime = (value?: string) => {
+  const d = new Date(value || '');
+  if (Number.isNaN(d.getTime())) return '';
+  return new Intl.DateTimeFormat('ko-KR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: 'Asia/Seoul',
+  }).format(d);
+};
+// "오늘" / "어제" / "9월 20일" for the collection date, in Seoul time.
+const dayLabel = (value?: string) => {
+  const d = new Date(value || '');
+  if (Number.isNaN(d.getTime())) return '';
+  const key = (x: Date) =>
+    new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Seoul' }).format(x);
+  const today = new Date();
+  const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+  if (key(d) === key(today)) return '오늘';
+  if (key(d) === key(yesterday)) return '어제';
+  return new Intl.DateTimeFormat('ko-KR', {
+    month: 'long',
+    day: 'numeric',
     timeZone: 'Asia/Seoul',
   }).format(d);
 };
@@ -104,6 +138,59 @@ const fitReason = (reason: string) =>
     .map((r) => fitLabels[r] || (/^[a-z_]+$/.test(r) ? '직무 관련성 검토' : r))
     .filter((v, i, a) => a.indexOf(v) === i)
     .join(' · ');
+// A posting counts as new when it was first seen within a day of the latest collection.
+const NEW_WINDOW_MS = 24 * 60 * 60 * 1000;
+const isNewJob = (job: Job, runAt?: string) => {
+  const seen = Date.parse(job.first_seen || '');
+  if (!Number.isFinite(seen)) return false;
+  const anchor = Date.parse(runAt || '');
+  return (
+    (Number.isFinite(anchor) ? anchor : Date.now()) - seen <= NEW_WINDOW_MS
+  );
+};
+const siteColor = (id: string) => siteStyle[id]?.color || '#8896a8';
+
+function SiteMark({ id, name }: { id: string; name: string }) {
+  const style = siteStyle[id] || { mark: name.charAt(0), color: '#4b647f' };
+  return (
+    <span
+      className="site-mark"
+      style={{ background: style.color }}
+      aria-hidden="true"
+    >
+      {style.mark}
+    </span>
+  );
+}
+function SiteDot({ id }: { id: string }) {
+  return (
+    <i
+      className="site-dot"
+      style={{ background: siteColor(id) }}
+      aria-hidden="true"
+    />
+  );
+}
+function PostingTitle({ job }: { job: Job }) {
+  return <h4 className="job-title">{job.title}</h4>;
+}
+// Opens the original posting (where the application is made) in a new tab.
+function VisitLink({ job }: { job: Job }) {
+  const link = safeUrl(job.url);
+  if (!link) return null;
+  return (
+    <a
+      className="visit-link"
+      href={link}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={`지원 페이지 가기: ${job.company} ${job.title} (새 창)`}
+    >
+      지원 페이지 가기
+      <ArrowUpRight size={15} aria-hidden="true" />
+    </a>
+  );
+}
 
 export default function Page() {
   const [session, setSession] = useState<Session | null>(null),
@@ -475,6 +562,8 @@ export default function Page() {
       setError((e as Error).message);
     }
   };
+  const [siteFilter, setSiteFilter] = useState('all'),
+    [searchOpen, setSearchOpen] = useState(false);
   const selectView = (value: string) => {
     setTab(value);
     setQuery('');
@@ -484,11 +573,52 @@ export default function Page() {
     `${j.company} ${j.title}`
       .toLocaleLowerCase()
       .includes(query.toLocaleLowerCase());
-  const active = (data?.applications || []).filter((j) =>
-    ['Applied', 'Responded', 'Interview', 'Offer'].includes(
-      j.canonical_status || '',
-    ),
+  const applications = data?.applications || [];
+  const active = applications.filter((j) =>
+    activeStates.includes(j.canonical_status || ''),
   );
+  const stageCounts = applicationStates
+    .map((id) => ({
+      id,
+      count: applications.filter((j) => j.canonical_status === id).length,
+    }))
+    .filter((s) => s.count > 0);
+  const appList =
+    appFilter === 'active'
+      ? active
+      : appFilter === 'all'
+        ? applications
+        : applications.filter((j) => j.canonical_status === appFilter);
+  const visibleApps = appList.filter(matches);
+  const recommended = data
+    ? data.sites.reduce((n, s) => n + s.jobs.length, 0)
+    : 0;
+  const knownSites = (data?.sites || []).filter(
+    (s) => siteStyle[s.id] || s.total > 0,
+  );
+  const emptySites = knownSites.filter((s) => !s.jobs.length);
+  const shownSites =
+    siteFilter === 'all'
+      ? knownSites.filter((s) => s.jobs.length)
+      : knownSites.filter((s) => s.id === siteFilter);
+  const newCount = (data?.sites || []).reduce(
+    (n, s) => n + s.jobs.filter((j) => isNewJob(j, data?.source_run_at)).length,
+    0,
+  );
+  const sitesWithJobs = knownSites.filter((s) => s.jobs.length).length;
+  const interviews = applications.filter(
+    (j) => j.canonical_status === 'Interview',
+  ).length;
+  const shownJobs = shownSites.reduce(
+    (n, s) => n + s.jobs.filter(matches).length,
+    0,
+  );
+  const openSearch = () => {
+    setSearchOpen(true);
+    requestAnimationFrame(() =>
+      document.getElementById('list-search')?.focus(),
+    );
+  };
   return (
     <MovementProvider
       busy={busy}
@@ -496,29 +626,50 @@ export default function Page() {
       onActiveChange={onMovementActive}
     >
       <div className="desk">
+        {session?.authenticated && (
+          <a className="skip-link" href="#main-content">
+            본문으로 건너뛰기
+          </a>
+        )}
         <header className="topbar">
           <Link href="/" className="brand" aria-label="Career Desk 홈">
             <span className="brand-mark">
-              <ArrowUpRight size={24} />
+              <ArrowUpRight size={22} />
             </span>
             career<span className="brand-light">desk</span>
           </Link>
-          <div className="private">
-            <ShieldCheck size={16} /> 나만의 커리어 공간
-          </div>
           {session?.authenticated ? (
-            <button
-              className="logout"
-              onClick={() => void logout()}
-              aria-label="로그아웃"
-              title="로그아웃"
-            >
-              <LogOut size={17} />
-            </button>
+            <div className="topbar-actions">
+              <Button
+                variant="ghost"
+                className="topbar-refresh"
+                disabled={loading || busy}
+                onClick={() => void refresh().catch(() => {})}
+                title="화면 새로고침"
+              >
+                <RefreshCw size={16} className={loading ? 'spin' : ''} />
+                <span className="sr-only">화면 새로고침, </span>
+                <span className="topbar-refresh-label">
+                  {loading
+                    ? '불러오는 중'
+                    : data
+                      ? `${clockTime(data.served_at || data.generated_at)} 갱신`
+                      : '새로고침'}
+                </span>
+              </Button>
+              <button
+                className="logout"
+                onClick={() => void logout()}
+                aria-label="로그아웃"
+                title="로그아웃"
+              >
+                <LogOut size={17} />
+              </button>
+            </div>
           ) : (
-            <span className="avatar">
-              <LockKeyhole size={16} />
-            </span>
+            <div className="private">
+              <ShieldCheck size={16} /> 나만의 커리어 공간
+            </div>
           )}
         </header>
         {!session?.authenticated ? (
@@ -577,28 +728,64 @@ export default function Page() {
             </div>
           </main>
         ) : (
-          <main className="main">
-            <div className="heading">
-              <div>
-                <div className="eyebrow">YOUR NEXT CHAPTER</div>
-                <h1>
-                  다음 기회를 만나보세요<span>.</span>
-                </h1>
-                <p>검토를 마치면, 다음 공고가 그 자리를 채웁니다.</p>
-              </div>
-              <Button
-                className="refresh"
-                variant="outline"
-                disabled={loading || busy}
-                onClick={() => void refresh().catch(() => {})}
-              >
-                <RefreshCw size={16} className={loading ? 'spin' : ''} />
-                {loading ? '불러오는 중' : '새로고침'}
-              </Button>
-            </div>
+          <main className="main" id="main-content" tabIndex={-1}>
+            <section className="page-head" aria-labelledby="page-title">
+              <h1 id="page-title">오늘의 검토</h1>
+              <dl className="today-summary">
+                <div
+                  className={`summary-cell${data?.stale ? ' is-stale' : ''}`}
+                >
+                  <dt>최근 수집</dt>
+                  <dd className="summary-value">
+                    {data?.source_run_at ? clockTime(data.source_run_at) : '–'}
+                  </dd>
+                  <dd className="summary-sub">
+                    {!data
+                      ? '불러오는 중'
+                      : !data.source_run_at
+                        ? '수집 기록 없음'
+                        : data.stale
+                          ? '수집 지연'
+                          : `${dayLabel(data.source_run_at)} 수집`}
+                  </dd>
+                </div>
+                <div className="summary-cell">
+                  <dt>추천</dt>
+                  <dd className="summary-value">
+                    {data ? `${recommended}건` : '–'}
+                  </dd>
+                  <dd className="summary-sub">
+                    {data ? `사이트 ${sitesWithJobs}곳` : ''}
+                  </dd>
+                </div>
+                <div className={`summary-cell${newCount ? ' is-new' : ''}`}>
+                  <dt>새로 발견</dt>
+                  <dd className="summary-value">
+                    {data ? `${newCount}건` : '–'}
+                  </dd>
+                  <dd className="summary-sub">최근 24시간</dd>
+                </div>
+                <div className="summary-cell">
+                  <dt>
+                    <span className="label-long">진행 중 지원</span>
+                    <span className="label-short">진행 중</span>
+                  </dt>
+                  <dd className="summary-value">
+                    {data ? `${active.length}건` : '–'}
+                  </dd>
+                  <dd className="summary-sub">
+                    {!data
+                      ? ''
+                      : interviews
+                        ? `면접 ${interviews}건`
+                        : `전체 ${applications.length}건`}
+                  </dd>
+                </div>
+              </dl>
+            </section>
             {error && (
               <div role="alert" className="alert error-alert">
-                {error}
+                <span>{error}</span>
                 <button
                   onClick={() => setError('')}
                   aria-label="오류 안내 닫기"
@@ -607,153 +794,161 @@ export default function Page() {
                 </button>
               </div>
             )}
-
             <MailSyncBar api={api} onChanged={onMailChanged} />
             {(data?.warnings || []).map((w, i) => (
               <div key={i} className="alert">
-                {w}
+                <span>{w}</span>
               </div>
             ))}
-            <div className="summary">
-              <button
-                className="metric"
-                aria-pressed={tab === 'discover'}
-                onClick={() => selectView('discover')}
-              >
-                <span>
-                  <Sparkles size={17} />
-                  지금 볼 추천
-                </span>
-                <strong>
-                  {data
-                    ? data.sites.reduce((n, s) => n + s.jobs.length, 0)
-                    : '—'}
-                  <small>사이트별 최대 5개</small>
-                </strong>
-              </button>
-              <button
-                className="metric"
-                aria-pressed={tab === 'applications'}
-                onClick={() => selectView('applications')}
-              >
-                <span>
-                  <BriefcaseBusiness size={17} />
-                  진행 중인 지원
-                </span>
-                <strong>
-                  {data ? active.length : '—'}
-                  <small>전체 {data?.applications.length ?? '—'}건</small>
-                </strong>
-              </button>
-              <button
-                className="metric"
-                aria-pressed={tab === 'pending'}
-                onClick={() => selectView('pending')}
-              >
-                <span>
-                  <Bookmark size={17} />
-                  지원보류
-                </span>
-                <strong>
-                  {data?.pending.total ?? '—'}
-                  <small>나중에 검토</small>
-                </strong>
-              </button>
-              <button
-                className="metric"
-                aria-pressed={tab === 'excluded'}
-                onClick={() => selectView('excluded')}
-              >
-                <span>
-                  <Inbox size={17} />
-                  지원제외
-                </span>
-                <strong>
-                  {data?.excluded.total ?? '—'}
-                  <small>검토 완료</small>
-                </strong>
-              </button>
-            </div>
             <Tabs value={tab} onValueChange={(v) => selectView(String(v))}>
               <div className="toolbar">
                 <TabsList className="main-tabs" variant="line">
                   <TabsTrigger value="discover">
-                    <LayoutGrid />
-                    추천 공고
+                    추천
+                    <span className="tab-count">
+                      {data ? recommended : '–'}
+                    </span>
                   </TabsTrigger>
                   <TabsTrigger value="applications">
-                    <BriefcaseBusiness />
-                    지원 현황
+                    <span className="tab-long">지원 현황</span>
+                    <span className="tab-short">지원</span>
+                    <span className="sr-only"> 진행 중</span>
+                    <span className="tab-count">
+                      {data ? active.length : '–'}
+                    </span>
                   </TabsTrigger>
                   <TabsTrigger value="pending">
-                    <Bookmark />
-                    지원보류
+                    <span className="tab-long">지원보류</span>
+                    <span className="tab-short">보류</span>
+                    <span className="tab-count">
+                      {data?.pending.total ?? '–'}
+                    </span>
                   </TabsTrigger>
                   <TabsTrigger value="excluded">
-                    <Inbox />
-                    지원제외
+                    <span className="tab-long">지원제외</span>
+                    <span className="tab-short">제외</span>
+                    <span className="tab-count">
+                      {data?.excluded.total ?? '–'}
+                    </span>
                   </TabsTrigger>
                 </TabsList>
-                <div className="search">
-                  <Search size={18} />
-                  <Input
-                    placeholder="현재 목록에서 회사·직무 검색"
-                    value={query}
-                    onChange={(e) => setQuery(e.target.value)}
-                    aria-label="현재 목록에서 회사 또는 직무 검색"
-                  />
+                <div className={`search${searchOpen || query ? ' open' : ''}`}>
+                  <button
+                    type="button"
+                    className="search-toggle"
+                    aria-label="현재 목록 검색 열기"
+                    aria-expanded={searchOpen || Boolean(query)}
+                    aria-controls="list-search"
+                    onClick={openSearch}
+                  >
+                    <Search size={18} />
+                  </button>
+                  <label className="search-field">
+                    <Search size={16} aria-hidden="true" />
+                    <Input
+                      id="list-search"
+                      placeholder="회사·직무 검색"
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      onBlur={() => !query && setSearchOpen(false)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Escape') {
+                          setQuery('');
+                          setSearchOpen(false);
+                          e.currentTarget.blur();
+                        }
+                      }}
+                      aria-label="현재 목록에서 회사 또는 직무 검색"
+                    />
+                    {query && (
+                      <button
+                        type="button"
+                        className="search-clear"
+                        onClick={() => {
+                          setQuery('');
+                          setSearchOpen(false);
+                        }}
+                        aria-label="검색어 지우기"
+                      >
+                        <X size={15} />
+                      </button>
+                    )}
+                  </label>
                 </div>
               </div>
               <TabsContent value="discover">
-                <div className="section-heading">
-                  <h2>
-                    사이트별 추천 <span>TOP 5</span>
-                  </h2>
-                  <span className="muted">
-                    {data?.source_run_at
-                      ? `${date(data.source_run_at, true)} 수집 결과`
-                      : '수집 결과를 연결하고 있습니다'}
-                  </span>
+                <div className="section-head">
+                  <h2>사이트별 추천</h2>
+                  <p className="section-note">
+                    사이트마다 상위 5개를 보여 줍니다. 지원·보류·제외하면 같은
+                    사이트의 다음 후보가 채워집니다. 행을 끌어서 다른 목록으로
+                    옮길 수도 있습니다.
+                  </p>
                 </div>
-                <div className="site-grid">
-                  {(data?.sites || [])
-                    .filter((s) => siteStyle[s.id] || s.total > 0)
-                    .map((s) => {
-                      const style = siteStyle[s.id] || {
-                        mark: s.name.charAt(0),
-                        color: '#4b647f',
-                      };
-                      const jobs = s.jobs.filter(matches);
-                      return (
-                        <section className="site-panel" key={s.id}>
-                          <header className="site-header">
-                            <span
-                              className="site-mark"
-                              style={{ background: style.color }}
+                {knownSites.length > 0 && (
+                  <fieldset className="chip-row">
+                    <legend className="sr-only">추천 출처 필터</legend>
+                    <button
+                      className="chip"
+                      aria-pressed={siteFilter === 'all'}
+                      onClick={() => setSiteFilter('all')}
+                    >
+                      전체 <b>{recommended}</b>
+                    </button>
+                    {knownSites.map((s) => (
+                      <button
+                        key={s.id}
+                        className="chip"
+                        aria-pressed={siteFilter === s.id}
+                        disabled={!s.jobs.length && siteFilter !== s.id}
+                        onClick={() => setSiteFilter(s.id)}
+                      >
+                        <SiteDot id={s.id} />
+                        {s.name} <b>{s.jobs.length}</b>
+                      </button>
+                    ))}
+                  </fieldset>
+                )}
+                <div className="rec-groups">
+                  {shownSites.map((s) => {
+                    const jobs = s.jobs.filter(matches);
+                    if (!jobs.length && query) return null;
+                    return (
+                      <section
+                        className="site-group"
+                        key={s.id}
+                        aria-labelledby={`site-${s.id}`}
+                      >
+                        <header className="site-group-head">
+                          <SiteMark id={s.id} name={s.name} />
+                          <h3 id={`site-${s.id}`}>{s.name}</h3>
+                          <span className="site-group-meta">
+                            {s.jobs.length}/5 표시
+                            {s.total > s.jobs.length
+                              ? ` · 다음 후보 ${s.total - s.jobs.length}개 대기`
+                              : ''}
+                          </span>
+                        </header>
+                        {jobs.length ? (
+                          jobs.map((j) => (
+                            <DraggableCard
+                              job={j}
+                              className="job-row"
+                              key={j.id}
                             >
-                              {style.mark}
-                            </span>
-                            <h3>{s.name}</h3>
-                            <span className="site-count">
-                              {s.jobs.length}
-                              <b> / 5</b>
-                            </span>
-                          </header>
-                          {jobs.length ? (
-                            jobs.map((j, i) => (
-                              <DraggableCard job={j} className="job" key={j.id}>
-                                <div className="job-top">
+                              <span className="job-rank" aria-hidden="true">
+                                {String(s.jobs.indexOf(j) + 1).padStart(2, '0')}
+                              </span>
+                              <div className="job-main">
+                                <div className="job-kicker">
                                   <span className="company">
                                     {j.company || '기업명 확인 필요'}
                                   </span>
-                                  <span className="job-tools">
-                                    <span className="rank">
-                                      {String(i + 1).padStart(2, '0')}
-                                    </span>
-                                    <MoveHandle job={j} />
-                                  </span>
+                                  {isNewJob(j, data?.source_run_at) && (
+                                    <span className="badge-new">NEW</span>
+                                  )}
                                 </div>
-                                <h4>{j.title}</h4>
+                                <PostingTitle job={j} />
                                 <div className="job-meta">
                                   {j.location && <span>{j.location}</span>}
                                   {j.first_seen && (
@@ -762,184 +957,219 @@ export default function Page() {
                                 </div>
                                 {j.reason && (
                                   <div className="fit">
-                                    <Sparkles size={14} />
+                                    <Sparkles size={13} aria-hidden="true" />
                                     <span>{fitReason(j.reason)}</span>
                                   </div>
                                 )}
-                                <div className="job-actions">
-                                  <Button
-                                    variant="outline"
+                              </div>
+                              <div className="job-actions">
+                                <VisitLink job={j} />
+                                <div className="action-group">
+                                  <button
+                                    type="button"
+                                    className="group-btn act-primary"
                                     disabled={busy}
                                     onClick={() => openDecision(j, 'applied')}
+                                    aria-label={`지원 완료로 기록: ${j.company} ${j.title}`}
                                   >
-                                    지원 기록
-                                  </Button>
-                                  <Button
-                                    variant="ghost"
+                                    <Check size={15} aria-hidden="true" />
+                                    지원 완료
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="group-btn"
                                     disabled={busy}
                                     onClick={() =>
                                       void changeDecision(j, 'pending').catch(
                                         () => {},
                                       )
                                     }
+                                    aria-label={`보류: ${j.company} ${j.title}`}
                                   >
-                                    <Clock3 size={14} />
-                                    지원보류
-                                  </Button>
-                                  <Button
-                                    variant="ghost"
+                                    <Clock3 size={15} aria-hidden="true" />
+                                    보류
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="group-btn"
                                     disabled={busy}
                                     onClick={() =>
                                       void moveJob(j, 'excluded').catch(
                                         () => {},
                                       )
                                     }
+                                    aria-label={`제외: ${j.company} ${j.title}`}
                                   >
-                                    <X size={14} />
+                                    <X size={15} aria-hidden="true" />
                                     제외
-                                  </Button>
-                                  {safeUrl(j.url) && (
-                                    <a
-                                      href={j.url}
-                                      target="_blank"
-                                      rel="noopener noreferrer"
-                                      aria-label={`${j.company} ${j.title} 공고 열기`}
-                                      title="원문 공고 열기"
-                                    >
-                                      <ArrowUpRight size={18} />
-                                    </a>
-                                  )}
+                                  </button>
                                 </div>
-                                <HistoryButton job={j} onOpen={setHistoryJob} />
-                              </DraggableCard>
-                            ))
-                          ) : (
-                            <Empty
-                              icon={<Inbox size={27} />}
-                              title={
-                                query
-                                  ? '검색과 일치하는 추천이 없습니다'
-                                  : '현재 추천할 공고가 없습니다'
-                              }
-                              detail={
-                                query
-                                  ? '검색어를 바꿔 확인해 보세요.'
-                                  : '다음 수집에서 확인된 새 공고가 채워집니다.'
-                              }
-                            />
-                          )}
-                          <div className="site-bottom">
-                            {s.total > s.jobs.length
-                              ? `다음 후보 ${s.total - s.jobs.length}개 대기 중`
-                              : s.jobs.length
-                                ? '확인된 후보를 모두 표시하고 있습니다'
-                                : '모집 여부가 확인된 공고만 표시합니다'}
-                          </div>
-                        </section>
-                      );
-                    })}
-                </div>
-                {!data && (
-                  <Empty
-                    icon={<RefreshCw className="spin" />}
-                    title="최근 수집 결과를 불러오고 있습니다"
-                    detail="잠시만 기다려 주세요."
-                  />
-                )}
-                <div className="recommendation-note">
-                  <Check size={15} />
-                  지원·지원보류·지원제외한 공고는 추천에서 빠집니다. 다음 후보가
-                  있으면 바로 채워집니다.
-                </div>
-              </TabsContent>
-              <TabsContent value="applications">
-                <div className="section-heading">
-                  <h2>
-                    지원 여정 <span>{data?.applications.length || 0}</span>
-                  </h2>
-                  <div className="filter-buttons">
-                    <button
-                      className={appFilter === 'active' ? 'selected' : ''}
-                      onClick={() => setAppFilter('active')}
-                    >
-                      진행 중 {active.length}
-                    </button>
-                    <button
-                      className={appFilter === 'all' ? 'selected' : ''}
-                      onClick={() => setAppFilter('all')}
-                    >
-                      전체 내역
-                    </button>
-                  </div>
-                </div>
-                <div className="application-list">
-                  {(appFilter === 'active' ? active : data?.applications || [])
-                    .filter(matches)
-                    .map((j) => (
-                      <article className="application" key={j.id}>
-                        <div
-                          className={`state-dot ${j.canonical_status === 'Rejected' ? 'closed' : ''}`}
-                        />
-                        <div className="application-info">
-                          <div className="company">{j.company}</div>
-                          <h3>{j.title}</h3>
-                          <div className="job-meta">
-                            <span>
-                              {typeof j.site_name === 'string'
-                                ? j.site_name
-                                : j.site || '지원 내역'}
-                            </span>
-                            {j.date && <span>기록 {date(j.date)}</span>}
-                          </div>
-                          {(j.note || j.notes) && (
-                            <p className="record-note">{j.note || j.notes}</p>
-                          )}
-                        </div>
-                        <div className="application-end">
-                          <HistoryButton job={j} onOpen={setHistoryJob} />
-                          <span
-                            className={`state-pill ${j.canonical_status === 'Rejected' ? 'closed' : ''}`}
-                          >
-                            {j.application_stage_label ||
-                              stateName[j.canonical_status || ''] ||
-                              j.canonical_status}
-                          </span>
+                              </div>
+                              <HistoryButton
+                                job={j}
+                                onOpen={setHistoryJob}
+                                compact
+                              />
+                            </DraggableCard>
+                          ))
+                        ) : (
+                          <Empty
+                            compact
+                            icon={<Check size={22} />}
+                            title="이 사이트의 추천을 모두 검토했습니다"
+                            detail="다음 수집에서 확인된 새 공고가 채워집니다."
+                          />
+                        )}
+                      </section>
+                    );
+                  })}
+                  {data && !shownJobs && (
+                    <Empty
+                      icon={<Inbox size={27} />}
+                      title={
+                        query
+                          ? '검색과 일치하는 추천이 없습니다'
+                          : recommended
+                            ? '선택한 출처에 추천이 없습니다'
+                            : '지금 검토할 추천이 없습니다'
+                      }
+                      detail={
+                        query
+                          ? '검색어를 바꾸거나 지워 보세요.'
+                          : '다음 수집에서 확인된 새 공고가 채워집니다.'
+                      }
+                      action={
+                        siteFilter !== 'all' && !query ? (
                           <Button
                             variant="outline"
-                            disabled={busy}
-                            onClick={() =>
-                              openDecision(
-                                j,
-                                j.canonical_status || 'Applied',
-                                true,
-                              )
-                            }
+                            onClick={() => setSiteFilter('all')}
                           >
-                            상태 변경
+                            전체 출처 보기
                           </Button>
-                          {safeUrl(j.url) && (
-                            <a
-                              href={j.url}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              aria-label="원문 공고 열기"
-                            >
-                              <ArrowUpRight size={18} />
-                            </a>
-                          )}
-                        </div>
-                      </article>
-                    ))}
-                  {!(
-                    appFilter === 'active' ? active : data?.applications || []
-                  ).filter(matches).length && (
+                        ) : undefined
+                      }
+                    />
+                  )}
+                  {!data && (
                     <Empty
-                      icon={<BriefcaseBusiness size={28} />}
-                      title="표시할 지원 내역이 없습니다"
+                      icon={<RefreshCw className="spin" />}
+                      title="최근 수집 결과를 불러오고 있습니다"
+                      detail="잠시만 기다려 주세요."
+                    />
+                  )}
+                </div>
+                {siteFilter === 'all' && emptySites.length > 0 && (
+                  <p className="empty-sites">
+                    <span>
+                      추천 없음 · {emptySites.map((s) => s.name).join(', ')}
+                    </span>
+                    <span>모집 여부가 확인된 공고만 표시합니다.</span>
+                  </p>
+                )}
+              </TabsContent>
+              <TabsContent value="applications">
+                <div className="section-head">
+                  <h2>지원 현황</h2>
+                  <p className="section-note">
+                    직접 기록한 상태와 메일에서 확인된 단계가 함께 반영됩니다.
+                  </p>
+                </div>
+                <fieldset className="chip-row">
+                  <legend className="sr-only">지원 단계 필터</legend>
+                  <button
+                    className="chip"
+                    aria-pressed={appFilter === 'active'}
+                    onClick={() => setAppFilter('active')}
+                  >
+                    진행 중 <b>{active.length}</b>
+                  </button>
+                  <button
+                    className="chip"
+                    aria-pressed={appFilter === 'all'}
+                    onClick={() => setAppFilter('all')}
+                  >
+                    전체 <b>{applications.length}</b>
+                  </button>
+                  {stageCounts.length > 0 && (
+                    <span className="chip-divider" aria-hidden="true" />
+                  )}
+                  {stageCounts.map((s) => (
+                    <button
+                      key={s.id}
+                      className={`chip tone-${stageTone(s.id)}`}
+                      aria-pressed={appFilter === s.id}
+                      onClick={() => setAppFilter(s.id)}
+                    >
+                      <i className="stage-dot" aria-hidden="true" />
+                      {stateName[s.id]} <b>{s.count}</b>
+                    </button>
+                  ))}
+                </fieldset>
+                <div className="list-panel">
+                  {visibleApps.map((j) => (
+                    <article
+                      className={`app-row tone-${stageTone(j.canonical_status)}`}
+                      key={j.id}
+                    >
+                      <span className="stage-dot" aria-hidden="true" />
+                      <div className="job-main">
+                        <div className="job-kicker">
+                          <span className="company">{j.company}</span>
+                          <span className="source-badge">
+                            <SiteDot id={j.site} />
+                            {typeof j.site_name === 'string'
+                              ? j.site_name
+                              : j.site || '지원 내역'}
+                          </span>
+                        </div>
+                        <PostingTitle job={j} />
+                        <div className="job-meta">
+                          {j.date && <span>기록 {date(j.date)}</span>}
+                        </div>
+                        {(j.note || j.notes) && (
+                          <p className="record-note">{j.note || j.notes}</p>
+                        )}
+                      </div>
+                      <div className="job-actions">
+                        <span
+                          className={`state-pill tone-${stageTone(j.canonical_status)}`}
+                        >
+                          {j.application_stage_label ||
+                            stateName[j.canonical_status || ''] ||
+                            j.canonical_status}
+                        </span>
+                        <VisitLink job={j} />
+                        <button
+                          type="button"
+                          className="btn-line"
+                          disabled={busy}
+                          onClick={() =>
+                            openDecision(
+                              j,
+                              j.canonical_status || 'Applied',
+                              true,
+                            )
+                          }
+                          aria-label={`상태 변경: ${j.company} ${j.title}`}
+                        >
+                          상태 변경
+                        </button>
+                      </div>
+                      <HistoryButton job={j} onOpen={setHistoryJob} compact />
+                    </article>
+                  ))}
+                  {!visibleApps.length && (
+                    <Empty
+                      icon={<BriefcaseBusiness size={26} />}
+                      title={
+                        query
+                          ? '검색과 일치하는 지원 내역이 없습니다'
+                          : '표시할 지원 내역이 없습니다'
+                      }
                       detail={
                         appFilter === 'active'
-                          ? '전체 내역에서 지난 지원 결과를 확인할 수 있습니다.'
-                          : '추천 공고에서 ‘지원 기록’을 눌러 기록하세요.'
+                          ? '전체에서 지난 지원 결과를 확인할 수 있습니다.'
+                          : '추천 공고에서 ‘지원 완료’를 눌러 기록하세요.'
                       }
                     />
                   )}
@@ -953,13 +1183,17 @@ export default function Page() {
                 <TabsContent key={status} value={status}>
                   {tab === status && (
                     <>
-                      <div className="section-heading">
+                      <div className="section-head">
                         <h2>
                           {status === 'pending'
                             ? '지원보류한 공고'
                             : '지원제외한 공고'}
                         </h2>
-                        <span className="muted">사이트별 확인 · 최근 5개</span>
+                        <p className="section-note">
+                          {status === 'pending'
+                            ? '나중에 다시 볼 공고입니다. 직접 복원하기 전까지 추천에 다시 나오지 않습니다.'
+                            : '검토를 마친 공고입니다. 필요하면 추천으로 복원할 수 있습니다.'}
+                        </p>
                       </div>
                       {data && (
                         <ArchivePanel
@@ -980,13 +1214,16 @@ export default function Page() {
                 </TabsContent>
               ))}
             </Tabs>
-            <footer>
-              CAREER DESK{' '}
-              <span>
-                {data
-                  ? `${date(data.served_at || data.generated_at, true)} 화면 갱신`
-                  : '나의 판단이 쌓이는 커리어 공간'}
-              </span>
+            <footer className="app-footer">
+              <span className="footer-brand">CAREER DESK</span>
+              <nav aria-label="서비스 안내">
+                {/* oxlint-disable-next-line nextjs/no-html-link-for-pages -- This link opens a static public HTML document. */}
+                <a href="/about.html">서비스 안내</a>
+                {/* oxlint-disable-next-line nextjs/no-html-link-for-pages -- This link opens a static public HTML document. */}
+                <a href="/privacy.html">개인정보처리방침</a>
+                {/* oxlint-disable-next-line nextjs/no-html-link-for-pages -- This link opens a static public HTML document. */}
+                <a href="/terms.html">이용 안내</a>
+              </nav>
             </footer>
           </main>
         )}
@@ -1030,30 +1267,26 @@ export default function Page() {
               </DialogDescription>
             </DialogHeader>
             {modal?.application ? (
-              <>
-                <label htmlFor="application-state">지원 상태</label>
-                <NativeSelect
-                  id="application-state"
-                  value={modal.status}
-                  onChange={(e) =>
-                    setModal({ ...modal, status: e.target.value })
-                  }
-                >
-                  {[
-                    'Applied',
-                    'Responded',
-                    'Interview',
-                    'Offer',
-                    'Hired',
-                    'Rejected',
-                    'Discarded',
-                  ].map((s) => (
-                    <NativeSelectOption key={s} value={s}>
-                      {stateName[s]}
-                    </NativeSelectOption>
+              <fieldset className="state-options" disabled={busy}>
+                <legend>지원 상태</legend>
+                <div className="state-grid">
+                  {applicationStates.map((s) => (
+                    <label
+                      key={s}
+                      className={`state-option tone-${stageTone(s)}`}
+                    >
+                      <input
+                        type="radio"
+                        name="application-state"
+                        value={s}
+                        checked={modal.status === s}
+                        onChange={() => setModal({ ...modal, status: s })}
+                      />
+                      <span>{stateName[s]}</span>
+                    </label>
                   ))}
-                </NativeSelect>
-              </>
+                </div>
+              </fieldset>
             ) : (
               <p className="dialog-hint">
                 {modal?.status === 'applied'
@@ -1106,7 +1339,7 @@ export default function Page() {
                   : modal?.application
                     ? '상태 저장'
                     : modal?.status === 'applied'
-                      ? '지원 내역 기록'
+                      ? '지원 완료로 기록'
                       : modal?.status === 'new'
                         ? '복원하기'
                         : '저장하기'}
@@ -1123,16 +1356,21 @@ function Empty({
   icon,
   title,
   detail,
+  action,
+  compact = false,
 }: {
   icon: React.ReactNode;
   title: string;
   detail: string;
+  action?: React.ReactNode;
+  compact?: boolean;
 }) {
   return (
-    <div className="empty">
+    <div className={`empty${compact ? ' compact' : ''}`}>
       {icon}
       <p>{title}</p>
       <span>{detail}</span>
+      {action}
     </div>
   );
 }
@@ -1160,7 +1398,6 @@ function ArchivePanel({
   const [site, setSite] = useState('all'),
     [first, setFirst] = useState(archive.items),
     [total, setTotal] = useState(archive.total),
-    [expanded, setExpanded] = useState(false),
     [more, setMore] = useState<Job[]>([]),
     [loading, setLoading] = useState(false),
     [error, setError] = useState('');
@@ -1215,7 +1452,6 @@ function ArchivePanel({
     requestVersion.current += 1;
     visibleCount.current = 5;
     setSite(selected);
-    setExpanded(false);
     setMore([]);
     setFirst([]);
     setTotal(
@@ -1251,48 +1487,37 @@ function ArchivePanel({
       if (version === requestVersion.current) setLoading(false);
     }
   };
+  // Return to the latest five without refetching; later refreshes stay at five.
+  const collapse = () => {
+    requestVersion.current += 1;
+    visibleCount.current = 5;
+    setMore([]);
+    setLoading(false);
+  };
   const row = (j: Job) => {
     const name = j.site_name || j.site || '출처 확인 필요';
-    const style = siteStyle[j.site];
-    const link = safeUrl(j.url);
     return (
       <DraggableCard
         job={j}
-        className="archive-row"
+        className="job-row archive-row"
         key={j.id}
         data-archive-status={status}
       >
-        <div className="archive-info">
-          <div className="job-top">
+        <div className="job-main">
+          <div className="job-kicker">
             <span className="company">{j.company}</span>
-            <MoveHandle job={j} />
-          </div>
-          <h4>
-            {link ? (
-              <a href={link} target="_blank" rel="noopener noreferrer">
-                {j.title}
-                <ArrowUpRight size={13} />
-              </a>
-            ) : (
-              j.title
-            )}
-          </h4>
-          <div className="archive-source-line">
-            <span className="source-label">공고 출처</span>
             <span className="source-badge">
-              <i style={{ background: style?.color || '#8896a8' }} />
+              <SiteDot id={j.site} />
               {name}
             </span>
-            {link && (
-              <a href={link} target="_blank" rel="noopener noreferrer">
-                공고 원문
-                <ArrowUpRight size={14} />
-              </a>
-            )}
-          </div>
-          <div className="job-meta">
-            <span>{date(j.decided_at || j.date || j.updated_at, true)}</span>
             {j.needs_review && <span className="review-badge">확인 필요</span>}
+          </div>
+          <PostingTitle job={j} />
+          <div className="job-meta">
+            <span>
+              {status === 'pending' ? '보류' : '제외'}{' '}
+              {date(j.decided_at || j.date || j.updated_at, true)}
+            </span>
           </div>
           {j.canonical_status === 'Discarded' && (
             <span className="archive-state">
@@ -1304,30 +1529,35 @@ function ArchivePanel({
             <p className="record-note">{j.note || j.notes}</p>
           )}
         </div>
-        <div className="archive-actions">
-          <HistoryButton job={j} onOpen={onHistory} />
+        <div className="job-actions">
+          <VisitLink job={j} />
           {isMovable(j) && (
-            <>
+            <div className="action-group">
               {status === 'pending' && (
-                <Button
-                  variant="ghost"
+                <button
+                  type="button"
+                  className="group-btn act-primary"
                   disabled={busy}
                   onClick={() => onDecision(j, 'applied')}
+                  aria-label={`지원 완료로 기록: ${j.company} ${j.title}`}
                 >
-                  지원 기록
-                </Button>
+                  <Check size={15} aria-hidden="true" />
+                  지원 완료
+                </button>
               )}
-              <Button
-                variant="ghost"
+              <button
+                type="button"
+                className="group-btn"
                 disabled={busy || !canMove(j, 'new')}
                 onClick={() => void onMove(j, 'new').catch(() => {})}
-                aria-label={`${j.company} ${j.title} 추천으로 복원`}
+                aria-label={`추천으로 복원: ${j.company} ${j.title}`}
               >
-                <Undo2 size={14} />
-                <span>복원</span>
-              </Button>
-              <Button
-                variant="ghost"
+                <Undo2 size={15} aria-hidden="true" />
+                복원
+              </button>
+              <button
+                type="button"
+                className="group-btn"
                 disabled={busy}
                 onClick={() =>
                   void onMove(
@@ -1335,62 +1565,58 @@ function ArchivePanel({
                     status === 'pending' ? 'excluded' : 'pending',
                   ).catch(() => {})
                 }
+                aria-label={`${status === 'pending' ? '제외' : '보류'}: ${j.company} ${j.title}`}
               >
-                {status === 'pending' ? <X size={14} /> : <Clock3 size={14} />}
-                <span>{status === 'pending' ? '제외' : '지원보류'}</span>
-              </Button>
-            </>
+                {status === 'pending' ? (
+                  <X size={15} aria-hidden="true" />
+                ) : (
+                  <Clock3 size={15} aria-hidden="true" />
+                )}
+                {status === 'pending' ? '제외' : '보류'}
+              </button>
+            </div>
           )}
         </div>
+        <HistoryButton job={j} onOpen={onHistory} compact />
       </DraggableCard>
     );
   };
   const filter = (j: Job) =>
     `${j.company} ${j.title}`.toLowerCase().includes(query.toLowerCase());
+  const remaining = total - first.length - more.length;
   return (
     <section
-      className="archive-panel archive-single"
+      className="list-panel archive-panel"
       aria-label={`${stateName[status]} 공고 목록`}
     >
-      <header className="archive-header">
-        <span className={`archive-icon ${status}`}>
-          {status === 'pending' ? <Clock3 size={19} /> : <Inbox size={19} />}
-        </span>
-        <h3>
-          {stateName[status]}
-          <span>{archive.total}</span>
-        </h3>
-        <span className="muted">
-          {site === 'all'
-            ? '전체 출처'
-            : siteChoices.find((s) => s.id === site)?.name ||
-              '선택한 출처'}{' '}
-          · {total}개
-        </span>
-      </header>
-      <div className="archive-filter">
-        <label htmlFor={`archive-site-${status}`}>공고 출처</label>
-        <NativeSelect
-          id={`archive-site-${status}`}
-          value={site}
-          onChange={(e) => selectSite(e.target.value)}
-        >
-          <NativeSelectOption value="all">
-            전체 출처 ({archive.total})
-          </NativeSelectOption>
+      {siteChoices.length > 0 && (
+        <fieldset className="chip-row panel-chips">
+          <legend className="sr-only">공고 출처 필터</legend>
+          <button
+            className="chip"
+            aria-pressed={site === 'all'}
+            onClick={() => selectSite('all')}
+          >
+            전체 <b>{archive.total}</b>
+          </button>
           {site !== 'all' && !siteChoices.some((s) => s.id === site) && (
-            <NativeSelectOption value={site}>
-              선택한 출처 (0)
-            </NativeSelectOption>
+            <button className="chip" aria-pressed="true">
+              선택한 출처 <b>0</b>
+            </button>
           )}
           {siteChoices.map((s) => (
-            <NativeSelectOption key={s.id} value={s.id}>
-              {s.name} ({s.total})
-            </NativeSelectOption>
+            <button
+              key={s.id}
+              className="chip"
+              aria-pressed={site === s.id}
+              onClick={() => selectSite(s.id)}
+            >
+              <SiteDot id={s.id} />
+              {s.name} <b>{s.total}</b>
+            </button>
           ))}
-        </NativeSelect>
-        <span>선택한 출처의 최근 5개</span>
-      </div>
+        </fieldset>
+      )}
       {error && (
         <p role="alert" className="error-text archive-error">
           {error}
@@ -1405,62 +1631,53 @@ function ArchivePanel({
       ) : (
         <>
           {first.filter(filter).map(row)}
-          {!first.filter(filter).length && !error && (
-            <Empty
-              icon={
-                status === 'pending' ? (
-                  <Bookmark size={23} />
-                ) : (
-                  <Check size={23} />
-                )
-              }
-              title={
-                query
-                  ? '일치하는 최근 기록이 없습니다'
-                  : status === 'pending'
-                    ? '지원보류한 공고가 없습니다'
-                    : '지원제외한 공고가 없습니다'
-              }
-              detail={
-                status === 'pending'
-                  ? '답장하지 않은 제안과 나중에 검토할 공고가 여기에 모입니다.'
-                  : '제외한 공고는 다시 추천하지 않습니다.'
-              }
-            />
-          )}
+          {more.filter(filter).map(row)}
+          {!first.filter(filter).length &&
+            !more.filter(filter).length &&
+            !error && (
+              <Empty
+                icon={
+                  status === 'pending' ? (
+                    <Bookmark size={23} />
+                  ) : (
+                    <Check size={23} />
+                  )
+                }
+                title={
+                  query
+                    ? '일치하는 기록이 없습니다'
+                    : status === 'pending'
+                      ? '지원보류한 공고가 없습니다'
+                      : '지원제외한 공고가 없습니다'
+                }
+                detail={
+                  status === 'pending'
+                    ? '답장하지 않은 제안과 나중에 검토할 공고가 여기에 모입니다.'
+                    : '제외한 공고는 다시 추천하지 않습니다.'
+                }
+              />
+            )}
         </>
       )}
-      {total > first.length && first.length > 0 && (
-        <Collapsible
-          open={expanded}
-          onOpenChange={(open) => {
-            setExpanded(open);
-            if (open && !more.length) void loadMore();
-          }}
-        >
-          <CollapsibleTrigger className="archive-toggle">
-            <span>
-              {expanded
-                ? '지난 기록 접기'
-                : `지난 기록 ${total - first.length}개 더보기`}
-            </span>
-            <ChevronDown size={16} className={expanded ? 'rotated' : ''} />
-          </CollapsibleTrigger>
-          <CollapsibleContent>
-            {more.filter(filter).map(row)}
-            {first.length + more.length < total && (
-              <Button
-                className="more-button"
-                variant="ghost"
-                disabled={loading}
-                onClick={() => void loadMore()}
-              >
-                {loading ? '불러오는 중…' : '더보기'}
-                <ChevronDown size={15} />
-              </Button>
-            )}
-          </CollapsibleContent>
-        </Collapsible>
+      {first.length > 0 && (remaining > 0 || more.length > 0) && (
+        <div className="list-more">
+          {remaining > 0 && (
+            <Button
+              variant="ghost"
+              className="more-button"
+              disabled={loading}
+              onClick={() => void loadMore()}
+            >
+              {loading ? '불러오는 중…' : `지난 기록 ${remaining}개 더 보기`}
+              <ChevronDown size={15} />
+            </Button>
+          )}
+          {more.length > 0 && (
+            <Button variant="ghost" className="more-button" onClick={collapse}>
+              최근 5개만 보기
+            </Button>
+          )}
+        </div>
       )}
     </section>
   );

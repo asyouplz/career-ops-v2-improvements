@@ -3,6 +3,8 @@ import { useEffect, useRef, useState } from 'react';
 import {
   ArrowUpRight,
   Check,
+  ChevronDown,
+  ChevronRight,
   Clock3,
   History,
   Mail,
@@ -29,6 +31,24 @@ const formatDate = (value?: string) => {
     minute: '2-digit',
     timeZone: 'Asia/Seoul',
   }).format(new Date(value));
+};
+// "오늘 09:34" for today in Seoul, otherwise "09. 21. 09:34".
+const shortTime = (value?: string) => {
+  const d = new Date(value || '');
+  if (Number.isNaN(d.getTime())) return '기록 없음';
+  const day = (x: Date) =>
+    new Intl.DateTimeFormat('ko-KR', {
+      dateStyle: 'short',
+      timeZone: 'Asia/Seoul',
+    }).format(x);
+  const clock = new Intl.DateTimeFormat('ko-KR', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZone: 'Asia/Seoul',
+  }).format(d);
+  if (day(d) === day(new Date())) return `오늘 ${clock}`;
+  return `${new Intl.DateTimeFormat('ko-KR', { month: '2-digit', day: '2-digit', timeZone: 'Asia/Seoul' }).format(d)} ${clock}`;
 };
 export const mailIsRunning = (sync: MailSync) =>
   [
@@ -82,6 +102,7 @@ export function MailSyncBar({
     message?: string;
   }>({});
   const [connecting, setConnecting] = useState(false);
+  const [open, setOpen] = useState(false);
   const pollEpoch = useRef(0);
   const wasRunning = useRef(false);
   const running = mailIsRunning(sync);
@@ -210,120 +231,164 @@ export function MailSyncBar({
     (sync.error && /[가-힣]/.test(sync.error)
       ? sync.error
       : '메일 조회 결과를 확인하지 못해 중단됐습니다. 다시 동기화하면 저장된 지점부터 이어서 처리합니다.');
+  const reviewCount = Number(sync.review_count) || 0;
+  const hasError = Boolean(error || sync.error || failed);
+  // Details stay folded in the normal state and open by themselves on errors.
+  const detailsOpen = open || hasError;
   return (
     <section
-      className={`mail-sync-bar${failed ? ' mail-sync-failed' : ''}`}
+      className={`sync-status${hasError ? ' is-failed' : ''}${running ? ' is-running' : ''}`}
       aria-label="메일 동기화 현황"
     >
-      <span className="mail-sync-icon">
-        <Mail size={21} />
-      </span>
-      <div className="mail-sync-copy" aria-live="polite">
-        <strong>
-          {running
-            ? sync.phase_label || '지원 관련 메일을 확인하고 있습니다'
-            : failed
-              ? '메일 동기화가 중단됐습니다'
-              : sync.status === 'complete'
-                ? '메일 동기화를 완료했습니다'
-                : '메일에서 이어지는 지원 기록'}
-        </strong>
-        {(sync.provider === 'gmail' || connection.connected) && (
-          <span>
-            Gmail 직접 연결 ·{' '}
-            {sync.provider !== 'gmail'
-              ? '연결 준비됨'
-              : failed
-                ? '메일 확인을 마치지 못했습니다'
-                : sync.sync_mode === 'incremental'
-                  ? '새로 바뀐 메일만 확인합니다'
-                  : running
-                    ? '기존 기록을 확인하고 있습니다'
-                    : '기존 기록 확인 완료'}
-          </span>
-        )}
-        {!connection.connected && connection.message && (
-          <span>{connection.message}</span>
-        )}
-        {sync.window_start && sync.window_end && (
-          <span>
-            {sync.sync_mode === 'incremental' ? '변경 확인 기간' : '검색 기간'}{' '}
-            · {formatDate(sync.window_start)} ~ {formatDate(sync.window_end)}
-          </span>
-        )}
-        {(running || failed) && <span>{syncProgress(sync)}</span>}
-        {(running || failed) && elapsed !== null && (
-          <span aria-live="off">
-            {modeLabel} · 경과 {formatDuration(elapsed)}
-          </span>
-        )}
-        {running &&
-          !sync.sync_mode &&
-          sync.resumed !== true &&
-          typeof sync.last_full_run?.duration_seconds === 'number' && (
-            <span>
-              직전 새 동기화 소요 ·{' '}
-              {formatDuration(sync.last_full_run.duration_seconds)}
-            </span>
-          )}
-        {!running && (
-          <span>
-            정상 반영된 메일 기준 · {formatDate(sync.last_success_at)}
-          </span>
-        )}
-        {!running && !failed && sync.completed_at && (
-          <span>
-            작업 완료 · {formatDate(sync.completed_at)}
-            {duration !== null ? ` · 소요 ${formatDuration(duration)}` : ''}
-          </span>
-        )}
-        {!running &&
-          sync.provider === 'gmail' &&
-          sync.status === 'complete' && (
-            <span>
-              이번 확인 대화 {Number(sync.processed_threads) || 0}개
-              {sync.sync_mode === 'incremental' &&
-              Number(sync.processed_threads) === 0
-                ? ' · 새로 읽을 대화가 없습니다'
-                : ''}
-            </span>
-          )}
-        {(sync.applied_count != null || sync.review_count != null) && (
-          <small>
+      <div className="sync-line">
+        <span className="sync-icon" aria-hidden="true">
+          <Mail size={17} />
+        </span>
+        <p className="sync-summary">
+          <strong aria-live="polite">
             {running
-              ? '확인 후 결과 반영 예정'
-              : `이번 실행 반영 ${Number(sync.applied_count) || 0}건`}{' '}
-            · 누적 확인 필요 {Number(sync.review_count) || 0}건
-          </small>
-        )}
-        {(error || sync.error || failed) && (
-          <output>{error || syncError}</output>
-        )}
-      </div>
-      {connection.configured &&
-        !connection.connected &&
-        connection.can_authorize && (
+              ? sync.phase_label || '지원 관련 메일을 확인하고 있습니다'
+              : failed
+                ? '메일 동기화가 중단됐습니다'
+                : sync.status === 'complete'
+                  ? '메일 동기화 완료'
+                  : '메일에서 이어지는 지원 기록'}
+          </strong>
+          {running ? (
+            <span>{syncProgress(sync)}</span>
+          ) : sync.last_success_at ? (
+            <span>마지막 반영 {shortTime(sync.last_success_at)}</span>
+          ) : !connection.connected && connection.message ? (
+            <span>{connection.message}</span>
+          ) : null}
+          {!running && reviewCount > 0 && (
+            <span className="sync-review">확인 필요 {reviewCount}건</span>
+          )}
+        </p>
+        <div className="sync-actions">
+          {connection.configured &&
+            !connection.connected &&
+            connection.can_authorize && (
+              <Button
+                variant="outline"
+                disabled={connecting || running}
+                onClick={() => void connect()}
+              >
+                <Mail size={15} />
+                {connecting ? 'Google로 이동 중' : 'Gmail 연결'}
+              </Button>
+            )}
           <Button
             variant="outline"
-            disabled={connecting || running}
-            onClick={() => void connect()}
+            className="sync-button"
+            disabled={requesting || running || sync.enabled === false}
+            onClick={() => void start()}
           >
-            <Mail size={15} />
-            {connecting ? 'Google로 이동 중' : 'Gmail 연결'}
+            <RefreshCw
+              size={15}
+              className={running || requesting ? 'spin' : ''}
+            />
+            <span className="sync-button-label">
+              {running || requesting
+                ? '동기화 중'
+                : failed
+                  ? '이어서 동기화'
+                  : '메일 동기화'}
+            </span>
           </Button>
-        )}
-      <Button
-        variant="outline"
-        disabled={requesting || running || sync.enabled === false}
-        onClick={() => void start()}
-      >
-        <RefreshCw size={15} className={running || requesting ? 'spin' : ''} />
-        {running || requesting
-          ? '동기화 중'
-          : failed
-            ? '이어서 동기화'
-            : '메일 동기화'}
-      </Button>
+          <button
+            type="button"
+            className="sync-toggle"
+            aria-expanded={detailsOpen}
+            aria-controls="sync-details"
+            disabled={hasError}
+            onClick={() => setOpen((value) => !value)}
+            title={detailsOpen ? '동기화 상세 접기' : '동기화 상세 보기'}
+          >
+            <ChevronDown size={17} className={detailsOpen ? 'rotated' : ''} />
+            <span className="sr-only">
+              {detailsOpen ? '동기화 상세 접기' : '동기화 상세 보기'}
+            </span>
+          </button>
+        </div>
+      </div>
+      {detailsOpen && (
+        <div className="sync-details" id="sync-details">
+          {(sync.provider === 'gmail' || connection.connected) && (
+            <span>
+              Gmail 직접 연결 ·{' '}
+              {sync.provider !== 'gmail'
+                ? '연결 준비됨'
+                : failed
+                  ? '메일 확인을 마치지 못했습니다'
+                  : sync.sync_mode === 'incremental'
+                    ? '새로 바뀐 메일만 확인합니다'
+                    : running
+                      ? '기존 기록을 확인하고 있습니다'
+                      : '기존 기록 확인 완료'}
+            </span>
+          )}
+          {!connection.connected && connection.message && (
+            <span>{connection.message}</span>
+          )}
+          {sync.window_start && sync.window_end && (
+            <span>
+              {sync.sync_mode === 'incremental'
+                ? '변경 확인 기간'
+                : '검색 기간'}{' '}
+              · {formatDate(sync.window_start)} ~ {formatDate(sync.window_end)}
+            </span>
+          )}
+          {(running || failed) && <span>{syncProgress(sync)}</span>}
+          {(running || failed) && elapsed !== null && (
+            <span aria-live="off">
+              {modeLabel} · 경과 {formatDuration(elapsed)}
+            </span>
+          )}
+          {running &&
+            !sync.sync_mode &&
+            sync.resumed !== true &&
+            typeof sync.last_full_run?.duration_seconds === 'number' && (
+              <span>
+                직전 새 동기화 소요 ·{' '}
+                {formatDuration(sync.last_full_run.duration_seconds)}
+              </span>
+            )}
+          {!running && (
+            <span>
+              정상 반영된 메일 기준 · {formatDate(sync.last_success_at)}
+            </span>
+          )}
+          {!running && !failed && sync.completed_at && (
+            <span>
+              작업 완료 · {formatDate(sync.completed_at)}
+              {duration !== null ? ` · 소요 ${formatDuration(duration)}` : ''}
+            </span>
+          )}
+          {!running &&
+            sync.provider === 'gmail' &&
+            sync.status === 'complete' && (
+              <span>
+                이번 확인 대화 {Number(sync.processed_threads) || 0}개
+                {sync.sync_mode === 'incremental' &&
+                Number(sync.processed_threads) === 0
+                  ? ' · 새로 읽을 대화가 없습니다'
+                  : ''}
+              </span>
+            )}
+          {(sync.applied_count != null || sync.review_count != null) && (
+            <small>
+              {running
+                ? '확인 후 결과 반영 예정'
+                : `이번 실행 반영 ${Number(sync.applied_count) || 0}건`}{' '}
+              · 누적 확인 필요 {Number(sync.review_count) || 0}건
+            </small>
+          )}
+          {(error || sync.error || failed) && (
+            <output>{error || syncError}</output>
+          )}
+        </div>
+      )}
     </section>
   );
 }
@@ -365,24 +430,42 @@ const labels: Record<string, string> = {
 export function HistoryButton({
   job,
   onOpen,
+  compact = false,
 }: {
   job: Job;
   onOpen: (job: Job) => void;
+  compact?: boolean;
 }) {
+  const mails =
+    typeof job.mail_count === 'number' && job.mail_count > 0
+      ? job.mail_count
+      : 0;
+  const label = `세부 내역${mails ? ` · 메일 ${mails}건` : ''}: ${job.company} ${job.title}`;
+  // In list rows this opens a detail view, so it reads as a link rather than an action.
+  if (compact)
+    return (
+      <button
+        type="button"
+        className="history-button detail-link"
+        onClick={() => onOpen(job)}
+        aria-label={label}
+      >
+        <span className="history-label">세부 내역</span>
+        {mails > 0 && <span className="history-count">메일 {mails}</span>}
+        <ChevronRight size={15} aria-hidden="true" />
+      </button>
+    );
   return (
     <Button
       variant="ghost"
       className="history-button"
       onClick={() => onOpen(job)}
-      aria-label={`${job.company} ${job.title} 세부 내역`}
+      aria-label={label}
+      title="세부 내역과 메모"
     >
-      <History size={14} />
-      <span>
-        세부 내역
-        {typeof job.mail_count === 'number' && job.mail_count > 0
-          ? ` · 메일 ${job.mail_count}`
-          : ''}
-      </span>
+      <History size={15} />
+      <span className="history-label">세부 내역</span>
+      {mails > 0 && <span className="history-count">메일 {mails}</span>}
     </Button>
   );
 }
