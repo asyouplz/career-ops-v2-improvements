@@ -34,7 +34,7 @@ import {
 
 import type { Job, Archive, Dashboard, MoveStatus } from './dashboard-types';
 import { isMovable, canMove, moveNames } from './dashboard-types';
-import { MovementProvider, MoveHandle, DraggableCard } from './job-movement';
+import { MovementProvider, DraggableCard } from './job-movement';
 import { MailSyncBar, JobHistory, HistoryButton } from './mail-panel';
 
 type Session = { authenticated: boolean; csrf_token?: string };
@@ -837,7 +837,8 @@ export default function Page() {
                   <h2>사이트별 추천</h2>
                   <p className="section-note">
                     사이트마다 상위 5개를 보여 줍니다. 지원·보류·제외하면 같은
-                    사이트의 다음 후보가 채워집니다.
+                    사이트의 다음 후보가 채워집니다. 행을 끌어서 다른 목록으로
+                    옮길 수도 있습니다.
                   </p>
                 </div>
                 {knownSites.length > 0 && (
@@ -918,47 +919,52 @@ export default function Page() {
                                 )}
                               </div>
                               <div className="job-actions">
-                                <Button
-                                  variant="outline"
-                                  className="act-primary"
-                                  disabled={busy}
-                                  onClick={() => openDecision(j, 'applied')}
-                                  aria-label={`지원 완료로 기록: ${j.company} ${j.title}`}
-                                >
-                                  <Check size={15} />
-                                  지원 완료
-                                </Button>
-                                <Button
-                                  variant="ghost"
-                                  disabled={busy}
-                                  onClick={() =>
-                                    void changeDecision(j, 'pending').catch(
-                                      () => {},
-                                    )
-                                  }
-                                  aria-label={`보류: ${j.company} ${j.title}`}
-                                >
-                                  <Clock3 size={15} />
-                                  보류
-                                </Button>
-                                <Button
-                                  variant="ghost"
-                                  disabled={busy}
-                                  onClick={() =>
-                                    void moveJob(j, 'excluded').catch(() => {})
-                                  }
-                                  aria-label={`제외: ${j.company} ${j.title}`}
-                                >
-                                  <X size={15} />
-                                  제외
-                                </Button>
-                                <HistoryButton
-                                  job={j}
-                                  onOpen={setHistoryJob}
-                                  compact
-                                />
+                                <div className="action-group">
+                                  <button
+                                    type="button"
+                                    className="group-btn act-primary"
+                                    disabled={busy}
+                                    onClick={() => openDecision(j, 'applied')}
+                                    aria-label={`지원 완료로 기록: ${j.company} ${j.title}`}
+                                  >
+                                    <Check size={15} aria-hidden="true" />
+                                    지원 완료
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="group-btn"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      void changeDecision(j, 'pending').catch(
+                                        () => {},
+                                      )
+                                    }
+                                    aria-label={`보류: ${j.company} ${j.title}`}
+                                  >
+                                    <Clock3 size={15} aria-hidden="true" />
+                                    보류
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="group-btn"
+                                    disabled={busy}
+                                    onClick={() =>
+                                      void moveJob(j, 'excluded').catch(
+                                        () => {},
+                                      )
+                                    }
+                                    aria-label={`제외: ${j.company} ${j.title}`}
+                                  >
+                                    <X size={15} aria-hidden="true" />
+                                    제외
+                                  </button>
+                                </div>
                               </div>
-                              <MoveHandle job={j} />
+                              <HistoryButton
+                                job={j}
+                                onOpen={setHistoryJob}
+                                compact
+                              />
                             </DraggableCard>
                           ))
                         ) : (
@@ -1087,8 +1093,9 @@ export default function Page() {
                             stateName[j.canonical_status || ''] ||
                             j.canonical_status}
                         </span>
-                        <Button
-                          variant="outline"
+                        <button
+                          type="button"
+                          className="btn-line"
                           disabled={busy}
                           onClick={() =>
                             openDecision(
@@ -1100,9 +1107,9 @@ export default function Page() {
                           aria-label={`상태 변경: ${j.company} ${j.title}`}
                         >
                           상태 변경
-                        </Button>
-                        <HistoryButton job={j} onOpen={setHistoryJob} compact />
+                        </button>
                       </div>
+                      <HistoryButton job={j} onOpen={setHistoryJob} compact />
                     </article>
                   ))}
                   {!visibleApps.length && (
@@ -1476,32 +1483,34 @@ function ArchivePanel({
             <p className="record-note">{j.note || j.notes}</p>
           )}
         </div>
-        <div className="job-actions">
-          {isMovable(j) && (
-            <>
+        {isMovable(j) && (
+          <div className="job-actions">
+            <div className="action-group">
               {status === 'pending' && (
-                <Button
-                  variant="outline"
-                  className="act-primary"
+                <button
+                  type="button"
+                  className="group-btn act-primary"
                   disabled={busy}
                   onClick={() => onDecision(j, 'applied')}
                   aria-label={`지원 완료로 기록: ${j.company} ${j.title}`}
                 >
-                  <Check size={15} />
+                  <Check size={15} aria-hidden="true" />
                   지원 완료
-                </Button>
+                </button>
               )}
-              <Button
-                variant="ghost"
+              <button
+                type="button"
+                className="group-btn"
                 disabled={busy || !canMove(j, 'new')}
                 onClick={() => void onMove(j, 'new').catch(() => {})}
                 aria-label={`추천으로 복원: ${j.company} ${j.title}`}
               >
-                <Undo2 size={15} />
-                <span>복원</span>
-              </Button>
-              <Button
-                variant="ghost"
+                <Undo2 size={15} aria-hidden="true" />
+                복원
+              </button>
+              <button
+                type="button"
+                className="group-btn"
                 disabled={busy}
                 onClick={() =>
                   void onMove(
@@ -1511,14 +1520,17 @@ function ArchivePanel({
                 }
                 aria-label={`${status === 'pending' ? '제외' : '보류'}: ${j.company} ${j.title}`}
               >
-                {status === 'pending' ? <X size={15} /> : <Clock3 size={15} />}
-                <span>{status === 'pending' ? '제외' : '보류'}</span>
-              </Button>
-            </>
-          )}
-          <HistoryButton job={j} onOpen={onHistory} compact />
-        </div>
-        <MoveHandle job={j} />
+                {status === 'pending' ? (
+                  <X size={15} aria-hidden="true" />
+                ) : (
+                  <Clock3 size={15} aria-hidden="true" />
+                )}
+                {status === 'pending' ? '제외' : '보류'}
+              </button>
+            </div>
+          </div>
+        )}
+        <HistoryButton job={j} onOpen={onHistory} compact />
       </DraggableCard>
     );
   };

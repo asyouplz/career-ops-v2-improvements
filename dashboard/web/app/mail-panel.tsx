@@ -4,6 +4,7 @@ import {
   ArrowUpRight,
   Check,
   ChevronDown,
+  ChevronRight,
   Clock3,
   History,
   Mail,
@@ -439,21 +440,32 @@ export function HistoryButton({
     typeof job.mail_count === 'number' && job.mail_count > 0
       ? job.mail_count
       : 0;
+  const label = `세부 내역${mails ? ` · 메일 ${mails}건` : ''}: ${job.company} ${job.title}`;
+  // In list rows this opens a detail view, so it reads as a link rather than an action.
+  if (compact)
+    return (
+      <button
+        type="button"
+        className="history-button detail-link"
+        onClick={() => onOpen(job)}
+        aria-label={label}
+      >
+        <span className="history-label">세부 내역</span>
+        {mails > 0 && <span className="history-count">메일 {mails}</span>}
+        <ChevronRight size={15} aria-hidden="true" />
+      </button>
+    );
   return (
     <Button
       variant="ghost"
-      className={`history-button${compact ? ' compact' : ''}`}
+      className="history-button"
       onClick={() => onOpen(job)}
-      aria-label={`세부 내역${mails ? ` · 메일 ${mails}건` : ''}: ${job.company} ${job.title}`}
+      aria-label={label}
       title="세부 내역과 메모"
     >
       <History size={15} />
       <span className="history-label">세부 내역</span>
-      {mails > 0 && (
-        <span className="history-count">
-          {compact ? mails : `메일 ${mails}`}
-        </span>
-      )}
+      {mails > 0 && <span className="history-count">메일 {mails}</span>}
     </Button>
   );
 }
