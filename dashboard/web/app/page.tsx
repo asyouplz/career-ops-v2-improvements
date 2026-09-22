@@ -170,19 +170,23 @@ function SiteDot({ id }: { id: string }) {
   );
 }
 function PostingTitle({ job }: { job: Job }) {
+  return <h4 className="job-title">{job.title}</h4>;
+}
+// Opens the original posting (where the application is made) in a new tab.
+function VisitLink({ job }: { job: Job }) {
   const link = safeUrl(job.url);
+  if (!link) return null;
   return (
-    <h4 className="job-title">
-      {link ? (
-        <a href={link} target="_blank" rel="noopener noreferrer">
-          {job.title}
-          <ArrowUpRight size={14} aria-hidden="true" />
-          <span className="sr-only"> (새 창에서 원문 공고 열기)</span>
-        </a>
-      ) : (
-        job.title
-      )}
-    </h4>
+    <a
+      className="visit-link"
+      href={link}
+      target="_blank"
+      rel="noopener noreferrer"
+      aria-label={`지원 페이지 가기: ${job.company} ${job.title} (새 창)`}
+    >
+      지원 페이지 가기
+      <ArrowUpRight size={15} aria-hidden="true" />
+    </a>
   );
 }
 
@@ -919,6 +923,7 @@ export default function Page() {
                                 )}
                               </div>
                               <div className="job-actions">
+                                <VisitLink job={j} />
                                 <div className="action-group">
                                   <button
                                     type="button"
@@ -1093,6 +1098,7 @@ export default function Page() {
                             stateName[j.canonical_status || ''] ||
                             j.canonical_status}
                         </span>
+                        <VisitLink job={j} />
                         <button
                           type="button"
                           className="btn-line"
@@ -1483,8 +1489,9 @@ function ArchivePanel({
             <p className="record-note">{j.note || j.notes}</p>
           )}
         </div>
-        {isMovable(j) && (
-          <div className="job-actions">
+        <div className="job-actions">
+          <VisitLink job={j} />
+          {isMovable(j) && (
             <div className="action-group">
               {status === 'pending' && (
                 <button
@@ -1528,8 +1535,8 @@ function ArchivePanel({
                 {status === 'pending' ? '제외' : '보류'}
               </button>
             </div>
-          </div>
-        )}
+          )}
+        </div>
         <HistoryButton job={j} onOpen={onHistory} compact />
       </DraggableCard>
     );

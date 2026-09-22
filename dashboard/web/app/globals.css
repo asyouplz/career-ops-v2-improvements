@@ -917,11 +917,40 @@ h2 {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: var(--sp-1);
+  gap: var(--sp-3);
 }
 .job-row > .detail-link,
 .app-row > .detail-link {
   grid-area: detail;
+}
+.visit-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: var(--tap-min);
+  padding: 0 var(--sp-4);
+  border: 1px solid var(--brand-border);
+  border-radius: var(--r-md);
+  background: var(--surface-accent);
+  color: var(--link);
+  font-size: var(--fs-xs);
+  font-weight: 650;
+  white-space: nowrap;
+  text-decoration: none;
+  transition:
+    background var(--ease),
+    border-color var(--ease),
+    color var(--ease);
+}
+.visit-link:hover {
+  border-color: var(--link);
+  color: var(--link-hover);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.visit-link svg {
+  flex-shrink: 0;
 }
 .job-kicker {
   display: flex;
@@ -953,21 +982,6 @@ h2 {
   letter-spacing: -0.3px;
   color: var(--text-strong);
   overflow-wrap: anywhere;
-}
-.job-title a {
-  color: var(--link);
-  text-decoration: none;
-  text-underline-offset: 4px;
-}
-.job-title a:hover {
-  color: var(--link-hover);
-  text-decoration: underline;
-}
-.job-title svg {
-  display: inline;
-  margin-left: var(--sp-1);
-  vertical-align: -1px;
-  color: currentColor;
 }
 .job-meta {
   display: flex;
@@ -1090,12 +1104,11 @@ h2 {
   border-radius: 0;
 }
 .group-btn.act-primary {
-  color: var(--link);
+  color: var(--text-strong);
   font-weight: 650;
 }
-.group-btn.act-primary:hover:not(:disabled) {
-  background: var(--surface-accent);
-  color: var(--link-hover);
+.group-btn.act-primary svg {
+  color: var(--success-text);
 }
 .btn-line {
   border: 1px solid var(--line-strong);
@@ -2130,8 +2143,14 @@ h2 {
       'actions actions actions';
   }
   .job-actions {
-    flex-wrap: nowrap;
+    flex-wrap: wrap;
     gap: var(--sp-2);
+  }
+  .job-actions .visit-link {
+    width: 100%;
+  }
+  .app-row .job-actions .visit-link {
+    order: 3;
   }
   .job-actions .action-group {
     width: 100%;
