@@ -149,6 +149,19 @@ const isNewJob = (job: Job, runAt?: string) => {
   );
 };
 const siteColor = (id: string) => siteStyle[id]?.color || '#8896a8';
+const isActiveRecommendation = (job: Job) => !job.recommendation_reviewed;
+const recommendationLabel = (job: Job) => {
+  if (job.recommendation_unavailable) return '모집 상태 확인 필요';
+  const decision = job.decision_status || job.movement_status;
+  if (decision === 'excluded' || decision === 'pending')
+    return stateName[decision];
+  return (
+    job.application_stage_label ||
+    job.canonical_status_label ||
+    stateName[job.canonical_status || decision || ''] ||
+    '검토 완료'
+  );
+};
 
 function SiteMark({ id, name }: { id: string; name: string }) {
   const style = siteStyle[id] || { mark: name.charAt(0), color: '#4b647f' };
@@ -200,6 +213,7 @@ export default function Page() {
     [error, setError] = useState(''),
     [busy, setBusy] = useState(false),
     [loading, setLoading] = useState(false),
+    [refilling, setRefilling] = useState(false),
     [password, setPassword] = useState(''),
     [notice, setNotice] = useState(''),
     [modal, setModal] = useState<{
@@ -355,6 +369,34 @@ export default function Page() {
     },
     [api, refresh],
   );
+  const refillRecommendations = async () => {
+    if (mutationActive.current || movementActive.current) return;
+    mutationActive.current = true;
+    refreshEpoch.current += 1;
+    setLoading(false);
+    setBusy(true);
+    setRefilling(true);
+    setError('');
+    const scroll = { left: window.scrollX, top: window.scrollY };
+    try {
+      const result = await api('/api/recommendations/refill', 'POST', {});
+      if (result.dashboard) setData(result.dashboard as Dashboard);
+      setNotice('수집된 후보에서 사이트별 추천을 다시 채웠습니다.');
+      requestAnimationFrame(() =>
+        window.scrollTo({ ...scroll, behavior: 'instant' }),
+      );
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      mutationActive.current = false;
+      setBusy(false);
+      setRefilling(false);
+      if (deferredRefresh.current) {
+        deferredRefresh.current = false;
+        void refresh().catch(() => {});
+      }
+    }
+  };
   const undoMove = useCallback(async () => {
     if (!undo || mutationActive.current) return;
     mutationActive.current = true;
@@ -591,10 +633,14 @@ export default function Page() {
         : applications.filter((j) => j.canonical_status === appFilter);
   const visibleApps = appList.filter(matches);
   const recommended = data
-    ? data.sites.reduce((n, s) => n + s.jobs.length, 0)
+    ? (data.stats.recommended ??
+      data.sites.reduce(
+        (n, s) => n + s.jobs.filter(isActiveRecommendation).length,
+        0,
+      ))
     : 0;
   const knownSites = (data?.sites || []).filter(
-    (s) => siteStyle[s.id] || s.total > 0,
+    (s) => siteStyle[s.id] || s.total > 0 || s.jobs.length > 0,
   );
   const emptySites = knownSites.filter((s) => !s.jobs.length);
   const shownSites =
@@ -602,10 +648,16 @@ export default function Page() {
       ? knownSites.filter((s) => s.jobs.length)
       : knownSites.filter((s) => s.id === siteFilter);
   const newCount = (data?.sites || []).reduce(
-    (n, s) => n + s.jobs.filter((j) => isNewJob(j, data?.source_run_at)).length,
+    (n, s) =>
+      n +
+      s.jobs.filter(
+        (j) => isActiveRecommendation(j) && isNewJob(j, data?.source_run_at),
+      ).length,
     0,
   );
-  const sitesWithJobs = knownSites.filter((s) => s.jobs.length).length;
+  const sitesWithJobs = knownSites.filter((s) =>
+    s.jobs.some(isActiveRecommendation),
+  ).length;
   const interviews = applications.filter(
     (j) => j.canonical_status === 'Interview',
   ).length;
@@ -877,13 +929,30 @@ export default function Page() {
                 </div>
               </div>
               <TabsContent value="discover">
-                <div className="section-head">
-                  <h2>사이트별 추천</h2>
-                  <p className="section-note">
-                    사이트마다 상위 5개를 보여 줍니다. 지원·보류·제외하면 같은
-                    사이트의 다음 후보가 채워집니다. 행을 끌어서 다른 목록으로
-                    옮길 수도 있습니다.
-                  </p>
+                <div className="section-head recommendation-head">
+                  <div>
+                    <h2>사이트별 추천</h2>
+                    <p className="section-note recommendation-note">
+                      검토한 공고는 현재 목록에 상태를 표시해 둡니다. 다음 정기
+                      수집 때 새 후보로 채우며, 지금 필요하면 수집된 후보에서
+                      사이트별 최대 5개를 다시 가져올 수 있습니다.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-line refill-button"
+                    disabled={!data || busy || dragging}
+                    aria-busy={refilling}
+                    onClick={() => void refillRecommendations()}
+                    title="이미 수집된 후보에서 사이트별 추천을 다시 채웁니다."
+                  >
+                    <RefreshCw
+                      size={15}
+                      className={refilling ? 'spin' : undefined}
+                      aria-hidden="true"
+                    />
+                    {refilling ? '추천 채우는 중' : '재공고 가지고 오기'}
+                  </button>
                 </div>
                 {knownSites.length > 0 && (
                   <fieldset className="chip-row">
@@ -904,7 +973,8 @@ export default function Page() {
                         onClick={() => setSiteFilter(s.id)}
                       >
                         <SiteDot id={s.id} />
-                        {s.name} <b>{s.jobs.length}</b>
+                        {s.name}{' '}
+                        <b>{s.jobs.filter(isActiveRecommendation).length}</b>
                       </button>
                     ))}
                   </fieldset>
@@ -912,6 +982,10 @@ export default function Page() {
                 <div className="rec-groups">
                   {shownSites.map((s) => {
                     const jobs = s.jobs.filter(matches);
+                    const activeCount = s.jobs.filter(
+                      isActiveRecommendation,
+                    ).length;
+                    const reviewedCount = s.jobs.length - activeCount;
                     if (!jobs.length && query) return null;
                     return (
                       <section
@@ -923,9 +997,12 @@ export default function Page() {
                           <SiteMark id={s.id} name={s.name} />
                           <h3 id={`site-${s.id}`}>{s.name}</h3>
                           <span className="site-group-meta">
-                            {s.jobs.length}/5 표시
-                            {s.total > s.jobs.length
-                              ? ` · 다음 후보 ${s.total - s.jobs.length}개 대기`
+                            검토 대기 {activeCount}개
+                            {reviewedCount > 0
+                              ? ` · 검토 완료 ${reviewedCount}개`
+                              : ''}
+                            {s.total > activeCount
+                              ? ` · 다음 후보 ${s.total - activeCount}개 대기`
                               : ''}
                           </span>
                         </header>
@@ -933,8 +1010,11 @@ export default function Page() {
                           jobs.map((j) => (
                             <DraggableCard
                               job={j}
-                              className="job-row"
+                              className={`job-row${j.recommendation_reviewed ? ' job-reviewed' : ''}`}
                               key={j.id}
+                              data-recommendation-reviewed={
+                                j.recommendation_reviewed || undefined
+                              }
                             >
                               <span className="job-rank" aria-hidden="true">
                                 {String(s.jobs.indexOf(j) + 1).padStart(2, '0')}
@@ -944,9 +1024,13 @@ export default function Page() {
                                   <span className="company">
                                     {j.company || '기업명 확인 필요'}
                                   </span>
-                                  {isNewJob(j, data?.source_run_at) && (
+                                  {j.recommendation_reviewed ? (
+                                    <span className="recommendation-state">
+                                      {recommendationLabel(j)}
+                                    </span>
+                                  ) : isNewJob(j, data?.source_run_at) ? (
                                     <span className="badge-new">NEW</span>
-                                  )}
+                                  ) : null}
                                 </div>
                                 <PostingTitle job={j} />
                                 <div className="job-meta">
@@ -964,46 +1048,74 @@ export default function Page() {
                               </div>
                               <div className="job-actions">
                                 <VisitLink job={j} />
-                                <div className="action-group">
-                                  <button
-                                    type="button"
-                                    className="group-btn act-primary"
-                                    disabled={busy}
-                                    onClick={() => openDecision(j, 'applied')}
-                                    aria-label={`지원 완료로 기록: ${j.company} ${j.title}`}
-                                  >
-                                    <Check size={15} aria-hidden="true" />
-                                    지원 완료
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="group-btn"
-                                    disabled={busy}
-                                    onClick={() =>
-                                      void changeDecision(j, 'pending').catch(
-                                        () => {},
-                                      )
-                                    }
-                                    aria-label={`보류: ${j.company} ${j.title}`}
-                                  >
-                                    <Clock3 size={15} aria-hidden="true" />
-                                    보류
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="group-btn"
-                                    disabled={busy}
-                                    onClick={() =>
-                                      void moveJob(j, 'excluded').catch(
-                                        () => {},
-                                      )
-                                    }
-                                    aria-label={`제외: ${j.company} ${j.title}`}
-                                  >
-                                    <X size={15} aria-hidden="true" />
-                                    제외
-                                  </button>
-                                </div>
+                                {isMovable(j) && (
+                                  <div className="action-group">
+                                    {j.movement_status !== 'excluded' && (
+                                      <button
+                                        type="button"
+                                        className="group-btn act-primary"
+                                        disabled={busy}
+                                        onClick={() =>
+                                          openDecision(j, 'applied')
+                                        }
+                                        aria-label={`지원 완료로 기록: ${j.company} ${j.title}`}
+                                      >
+                                        <Check size={15} aria-hidden="true" />
+                                        지원 완료
+                                      </button>
+                                    )}
+                                    {j.recommendation_reviewed && (
+                                      <button
+                                        type="button"
+                                        className="group-btn"
+                                        disabled={busy || !canMove(j, 'new')}
+                                        onClick={() =>
+                                          void moveJob(j, 'new').catch(() => {})
+                                        }
+                                        aria-label={`추천으로 복원: ${j.company} ${j.title}`}
+                                      >
+                                        <Undo2 size={15} aria-hidden="true" />
+                                        복원
+                                      </button>
+                                    )}
+                                    {j.movement_status !== 'pending' && (
+                                      <button
+                                        type="button"
+                                        className="group-btn"
+                                        disabled={
+                                          busy || !canMove(j, 'pending')
+                                        }
+                                        onClick={() =>
+                                          void moveJob(j, 'pending').catch(
+                                            () => {},
+                                          )
+                                        }
+                                        aria-label={`보류: ${j.company} ${j.title}`}
+                                      >
+                                        <Clock3 size={15} aria-hidden="true" />
+                                        보류
+                                      </button>
+                                    )}
+                                    {j.movement_status !== 'excluded' && (
+                                      <button
+                                        type="button"
+                                        className="group-btn"
+                                        disabled={
+                                          busy || !canMove(j, 'excluded')
+                                        }
+                                        onClick={() =>
+                                          void moveJob(j, 'excluded').catch(
+                                            () => {},
+                                          )
+                                        }
+                                        aria-label={`제외: ${j.company} ${j.title}`}
+                                      >
+                                        <X size={15} aria-hidden="true" />
+                                        제외
+                                      </button>
+                                    )}
+                                  </div>
+                                )}
                               </div>
                               <HistoryButton
                                 job={j}
@@ -1017,7 +1129,7 @@ export default function Page() {
                             compact
                             icon={<Check size={22} />}
                             title="이 사이트의 추천을 모두 검토했습니다"
-                            detail="다음 수집에서 확인된 새 공고가 채워집니다."
+                            detail="다음 정기 수집을 기다리거나 ‘재공고 가지고 오기’를 눌러 주세요."
                           />
                         )}
                       </section>
@@ -1036,7 +1148,7 @@ export default function Page() {
                       detail={
                         query
                           ? '검색어를 바꾸거나 지워 보세요.'
-                          : '다음 수집에서 확인된 새 공고가 채워집니다.'
+                          : '다음 정기 수집을 기다리거나 ‘재공고 가지고 오기’를 눌러 주세요.'
                       }
                       action={
                         siteFilter !== 'all' && !query ? (

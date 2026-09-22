@@ -480,8 +480,69 @@ class Store:
             return None, None
         return max(matches, key=lambda pair: pair[1].get('updated_at', ''))
 
-    def snapshot(self):
-        with self.mutex:
+    def recommendation_selection(self, groups, export, jobs, decisions, rows, eligible, refill=False):
+        """Keep this collection's review slots until a new collection or explicit refill."""
+        path = self.c.data / 'dashboard-recommendations.json'
+        batch = read_json(path, {'version': 1, 'source_key': None, 'sites': []})
+        if (not isinstance(batch, dict) or batch.get('version') != 1 or 'source_key' not in batch
+                or (batch['source_key'] is not None and (not isinstance(batch['source_key'], str)
+                    or not isinstance(batch.get('selected_at'), str) or not batch['selected_at']))
+                or not isinstance(batch.get('sites'), list)
+                or any(not isinstance(group, dict) or not isinstance(group.get('id'), str)
+                       or not isinstance(group.get('jobs'), list) or len(group['jobs']) > 5
+                       or any(not isinstance(job, dict) or not isinstance(job.get('id'), str) or not job['id'] for job in group['jobs'])
+                       for group in batch['sites'])):
+            raise APIError(503, 'recommendations_invalid', '추천 목록의 저장 상태를 확인해야 합니다. 기존 검토 기록은 보존했습니다.')
+        if len({group['id'] for group in batch['sites']}) != len(batch['sites']):
+            raise APIError(503, 'recommendations_invalid', '추천 목록의 출처를 확인해야 합니다. 기존 검토 기록은 보존했습니다.')
+        # generated_at also changes on re-export. Only a new collection should
+        # replace the current review slots; older exporters have no run timestamp.
+        source_key = export.get('source_run_at') or export.get('generated_at')
+        if not source_key:
+            source_key = hashlib.sha256(json.dumps(export, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        if refill or batch['source_key'] != source_key:
+            batch = {'version': 1, 'source_key': source_key, 'selected_at': now(),
+                     'sites': [{'id': group['id'], 'name': group['name'], 'jobs': copy.deepcopy(group['jobs'])}
+                               for group in groups.values()]}
+            atomic_json(path, batch)
+        by_alias = {alias: job for job in reversed(jobs) for alias in aliases(job)}
+        for group in groups.values():
+            group['jobs'] = []
+        reviewed = 0
+        selected_aliases = set()
+        for selected in batch['sites']:
+            group = groups.setdefault(selected['id'], {'id': selected['id'], 'name': selected.get('name', selected['id']), 'total': 0, 'jobs': []})
+            for saved in selected['jobs']:
+                raw = next((by_alias[alias] for alias in sorted(aliases(saved)) if alias in by_alias), saved)
+                job = copy.deepcopy(raw)
+                if aliases(job) & selected_aliases:
+                    continue
+                selected_aliases |= aliases(job)
+                _, decision = self.matching_decision(job, decisions)
+                row = self.matched_row(job, rows)
+                if decision and decision.get('withdrawn') and decision['status'] == 'excluded':
+                    category = 'excluded'
+                elif row and is_application(row, decision):
+                    category = 'applied'
+                elif row and row['status'] in {'SKIP', 'Discarded'}:
+                    category = 'excluded'
+                else:
+                    category = (decision or {}).get('status', 'new')
+                if row:
+                    job.update(tracker_id=row['num'], canonical_status=row['status'], canonical_status_label=STATUSES_KO[row['status']])
+                if decision:
+                    job.update(updated_at=decision.get('updated_at', ''), decided_at=decision.get('effective_at') or decision.get('updated_at', ''))
+                unavailable = category == 'new' and not aliases(job) & eligible
+                job.update(decision_status=category, recommendation_reviewed=category != 'new' or unavailable,
+                           recommendation_unavailable=bool(unavailable))
+                reviewed += int(job['recommendation_reviewed'])
+                group['jobs'].append(job)
+        return {'selected_at': batch['selected_at'], 'source_run_at': export.get('source_run_at') or export.get('generated_at'),
+                'reviewed_count': reviewed}
+
+    def snapshot(self, refill=False):
+        # Selection persistence shares the decision lock with manual/mail updates.
+        with self.lock():
             export = self.export_data()
             decisions = self.decision_data()
             rows = self.tracker_rows()
@@ -550,7 +611,7 @@ class Store:
                 else:
                     continue
                 groups[sid] = {'id': sid, 'name': name, 'total': 0, 'jobs': []}
-            seen = set()
+            seen, eligible = set(), set()
             for job in jobs:
                 if not job['dashboard_eligible'] or job['liveness'] != 'active':
                     continue
@@ -576,11 +637,13 @@ class Store:
                     continue
                 if decision:
                     job['updated_at'] = decision.get('updated_at', '')
+                eligible |= aliases(job)
                 sid = job['site']
                 group = groups.setdefault(sid, {'id': sid, 'name': job['site_name'], 'total': 0, 'jobs': []})
                 group['total'] += 1
                 if len(group['jobs']) < 5:
                     group['jobs'].append(job)
+            selection = self.recommendation_selection(groups, export, jobs, decisions['decisions'], rows, eligible, refill)
             pending.sort(key=lambda j: j.get('decided_at') or j.get('updated_at', ''), reverse=True)
             excluded.sort(key=lambda j: j.get('decided_at') or j.get('date', ''), reverse=True)
             applications.sort(key=lambda j: j.get('date') or j.get('published_at') or j.get('updated_at', ''), reverse=True)
@@ -602,16 +665,21 @@ class Store:
             if stale:
                 warnings.append('마지막 수집 시점이 오래되었거나 확인되지 않았습니다. 공고 원문에서 현재 모집 여부를 확인해 주세요.')
             status_counts = {s: sum(x.get('canonical_status') == s for x in applications) for s in CANONICAL}
-            result = {'generated_at': export.get('generated_at'), 'source_run_at': source_run_at, 'updated_at': decisions.get('updated_at', ''), 'served_at': now(), 'sites': list(groups.values()), 'applications': applications, 'pending': {'items': pending[:5], 'total': len(pending), 'sources': archive_sources(pending)}, 'excluded': {'items': excluded[:5], 'total': len(excluded), 'sources': archive_sources(excluded)}, 'stats': {'recommended': sum(len(g['jobs']) for g in groups.values()), 'available': sum(g['total'] for g in groups.values()), 'applications': len(applications), 'pending': len(pending), 'excluded': len(excluded), 'application_statuses': status_counts}, 'canonical_statuses': [{'id': s, 'label': STATUSES_KO[s]} for s in CANONICAL], 'stale': stale, 'warnings': warnings}
+            result = {'generated_at': export.get('generated_at'), 'source_run_at': source_run_at, 'updated_at': decisions.get('updated_at', ''), 'served_at': now(), 'sites': list(groups.values()), 'recommendation_batch': selection, 'applications': applications, 'pending': {'items': pending[:5], 'total': len(pending), 'sources': archive_sources(pending)}, 'excluded': {'items': excluded[:5], 'total': len(excluded), 'sources': archive_sources(excluded)}, 'stats': {'recommended': sum(not j['recommendation_reviewed'] for g in groups.values() for j in g['jobs']), 'available': sum(g['total'] for g in groups.values()), 'applications': len(applications), 'pending': len(pending), 'excluded': len(excluded), 'application_statuses': status_counts}, 'canonical_statuses': [{'id': s, 'label': STATUSES_KO[s]} for s in CANONICAL], 'stale': stale, 'warnings': warnings}
             ledger = self.mail_ledger()
             for category, items in [('new', [j for g in groups.values() for j in g['jobs']]), ('applied', applications), ('pending', pending), ('excluded', excluded)]:
                 for item in items:
-                    self.decorate_job(item, category, decisions['decisions'], rows, ledger, export['jobs'])
+                    self.decorate_job(item, item['decision_status'] if category == 'new' else category, decisions['decisions'], rows, ledger, export['jobs'])
+                    if item.get('recommendation_unavailable'):
+                        item.update(movable=False, allowed_moves=[], movement_disabled_reason='현재 모집 여부를 확인할 수 없는 공고입니다.')
             result['mail_sync'] = self.mail_sync_status()
             return result, {'pending': pending, 'excluded': excluded}, (export, decisions, rows, jobs)
 
     def dashboard(self):
         return self.snapshot()[0]
+
+    def refill_recommendations(self):
+        return {'ok': True, 'dashboard': self.snapshot(refill=True)[0]}
 
     def archive(self, status, offset, limit, site='all'):
         items = self.snapshot()[1][status]
@@ -1451,6 +1519,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.require_auth()
                 if method == 'GET' and path == '/api/dashboard':
                     return self.send(200, self.server.store.dashboard())
+                if method == 'POST' and path == '/api/recommendations/refill':
+                    self.require_csrf()
+                    self.json_body()
+                    return self.send(200, self.server.store.refill_recommendations())
                 if method == 'GET' and path == '/api/decisions':
                     params = parse_qs(parsed.query)
                     status = params.get('status', [''])[0]
