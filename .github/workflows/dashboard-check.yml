@@ -26,7 +26,9 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: python -m pip install -r requirements.txt
       - run: npm run setup
+      - run: python dashboard/backend/tests/run_checks.py
       - run: npm run dashboard:install
+      - run: node --experimental-strip-types --test dashboard/web/tests/refresh-queue.test.mjs
       - run: npm --prefix dashboard/web run lint
       - run: npm --prefix dashboard/web run typecheck
       - run: npm run dashboard:build

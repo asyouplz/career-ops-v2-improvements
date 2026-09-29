@@ -20,6 +20,7 @@ jobs:
               '.github/workflows/no-user-data.yml',
               '.github/workflows/dashboard-check.yml',
               'dashboard/WEB.md',
+              'dashboard/PERFORMANCE.md',
               'dashboard/backend/mail-sync/GMAIL_SETUP.md',
               'dashboard/backend/mail-sync/classifier.py',
               'dashboard/backend/mail-sync/gmail_api.py',
@@ -48,6 +49,7 @@ jobs:
               'dashboard/web/components/ui/tabs.tsx',
               'dashboard/web/components/ui/textarea.tsx',
               'dashboard/web/lib/utils.ts',
+              'dashboard/web/lib/refresh-queue.ts',
               'dashboard/web/next.config.ts',
               'dashboard/web/package-lock.json',
               'dashboard/web/package.json',
@@ -84,9 +86,22 @@ jobs:
             ]);
             const bundledCode = /^engine\/(?:providers\/|plugins\/|lib\/)?[a-zA-Z0-9_-]+\.(?:mjs|js)$/;
             const bundledMetadata = new Set(['engine/LICENSE', 'engine/templates/states.yml', 'engine/tracker-aliases.json']);
+            // Reviewed tests generate temporary synthetic records, without user data.
+            // Keep this exact list: new tests still require a separate content review.
+            const syntheticTests = new Set([
+              'dashboard/backend/tests/run_checks.py',
+              'dashboard/backend/tests/test_canonical_integration.py',
+              'dashboard/backend/tests/test_mail_moves.py',
+              'dashboard/backend/tests/test_mail_sync_status.py',
+              'dashboard/backend/tests/test_mail_timing_status.py',
+              'dashboard/backend/tests/test_performance.py',
+              'dashboard/backend/tests/test_recommendation_batch.py',
+              'dashboard/backend/tests/test_server.py',
+              'dashboard/web/tests/refresh-queue.test.mjs',
+            ]);
             const excluded = /(^|\/)(?:tests?|fixtures?|__tests__|__mocks__)(\/|[-_.])|\.(?:test|spec)\.|(^|\/)test[-_]/;
-            const permitted = file => !excluded.test(file)
-              && (allowed.has(file) || bundledMetadata.has(file) || bundledCode.test(file));
+            const permitted = file => syntheticTests.has(file) || (!excluded.test(file)
+              && (allowed.has(file) || bundledMetadata.has(file) || bundledCode.test(file)));
             const files = await github.paginate(github.rest.pulls.listFiles, {
               ...context.repo,
               pull_number: context.payload.pull_request.number,
