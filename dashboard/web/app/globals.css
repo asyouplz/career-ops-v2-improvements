@@ -2364,3 +2364,11 @@ h2 {
     scroll-behavior: auto !important;
   }
 }
+.saving-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
+}

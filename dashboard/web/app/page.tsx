@@ -36,6 +36,7 @@ import type { Job, Archive, Dashboard, MoveStatus } from './dashboard-types';
 import { isMovable, canMove, moveNames } from './dashboard-types';
 import { MovementProvider, DraggableCard } from './job-movement';
 import { MailSyncBar, JobHistory, HistoryButton } from './mail-panel';
+import { createRefreshQueue } from '@/lib/refresh-queue';
 
 type Session = { authenticated: boolean; csrf_token?: string };
 type Decision = 'pending' | 'excluded' | 'applied' | 'new';
@@ -212,6 +213,7 @@ export default function Page() {
     [query, setQuery] = useState(''),
     [error, setError] = useState(''),
     [busy, setBusy] = useState(false),
+    [savingJobId, setSavingJobId] = useState<string | null>(null),
     [loading, setLoading] = useState(false),
     [refilling, setRefilling] = useState(false),
     [password, setPassword] = useState(''),
@@ -234,6 +236,13 @@ export default function Page() {
     latest.current = { data, session };
   }, [data, session]);
   const refreshEpoch = useRef(0);
+  const lastRefreshAt = useRef(0);
+  const refreshQueue =
+    useRef(createRefreshQueue<Record<string, unknown> | undefined>());
+  const acceptDashboard = useCallback((dashboard: Dashboard) => {
+    setData(dashboard);
+    lastRefreshAt.current = Date.now();
+  }, []);
   const api = useCallback(
     async (path: string, method = 'GET', body?: unknown) => {
       const r = await fetch(path, {
@@ -279,28 +288,37 @@ export default function Page() {
         deferredRefresh.current = true;
         return;
       }
-      const epoch = ++refreshEpoch.current;
-      setLoading(true);
-      try {
-        const d = await api('/api/dashboard');
-        if (
-          epoch === refreshEpoch.current &&
-          (force || !movementActive.current)
-        ) {
-          setData(d as unknown as Dashboard);
-          setError('');
+      const epoch = refreshEpoch.current;
+      return refreshQueue.current.run(epoch, async () => {
+        if (epoch !== refreshEpoch.current) return;
+        if (!force && (movementActive.current || mutationActive.current)) {
+          deferredRefresh.current = true;
+          return;
         }
-        return d;
-      } catch (e) {
-        if (epoch === refreshEpoch.current) setError((e as Error).message);
-        throw e;
-      } finally {
-        if (epoch === refreshEpoch.current) setLoading(false);
-      }
+        setLoading(true);
+        try {
+          const d = await api('/api/dashboard');
+          if (
+            epoch === refreshEpoch.current &&
+            (force || !movementActive.current)
+          ) {
+            acceptDashboard(d as unknown as Dashboard);
+            setError('');
+          }
+          return d;
+        } catch (e) {
+          if (epoch === refreshEpoch.current) setError((e as Error).message);
+          throw e;
+        } finally {
+          if (epoch === refreshEpoch.current) setLoading(false);
+        }
+      });
     },
-    [api],
+    [api, acceptDashboard],
   );
   const onMailChanged = useCallback(() => {
+    // Mail/history edits may finish while an older GET is still in flight.
+    refreshEpoch.current += 1;
     void refresh().catch(() => {});
   }, [refresh]);
   const onMovementActive = useCallback(
@@ -326,6 +344,7 @@ export default function Page() {
       refreshEpoch.current += 1;
       setLoading(false);
       setBusy(true);
+      setSavingJobId(job.id);
       setError('');
       setUndo(null);
       try {
@@ -336,7 +355,7 @@ export default function Page() {
           ...(noteText !== undefined ? { note: noteText } : {}),
         });
         refreshEpoch.current += 1;
-        if (r.dashboard) setData(r.dashboard as Dashboard);
+        if (r.dashboard) acceptDashboard(r.dashboard as Dashboard);
         setModal(null);
         setNote('');
         setNotice(
@@ -365,9 +384,14 @@ export default function Page() {
       } finally {
         mutationActive.current = false;
         setBusy(false);
+        setSavingJobId(null);
+        if (deferredRefresh.current) {
+          deferredRefresh.current = false;
+          void refresh().catch(() => {});
+        }
       }
     },
-    [api, refresh],
+    [api, refresh, acceptDashboard],
   );
   const refillRecommendations = async () => {
     if (mutationActive.current || movementActive.current) return;
@@ -380,7 +404,7 @@ export default function Page() {
     const scroll = { left: window.scrollX, top: window.scrollY };
     try {
       const result = await api('/api/recommendations/refill', 'POST', {});
-      if (result.dashboard) setData(result.dashboard as Dashboard);
+      if (result.dashboard) acceptDashboard(result.dashboard as Dashboard);
       setNotice('수집된 후보에서 사이트별 추천을 다시 채웠습니다.');
       requestAnimationFrame(() =>
         window.scrollTo({ ...scroll, behavior: 'instant' }),
@@ -406,7 +430,7 @@ export default function Page() {
     setError('');
     try {
       const r = await api('/api/moves/undo', 'POST', { token: undo.token });
-      if (r.dashboard) setData(r.dashboard as Dashboard);
+      if (r.dashboard) acceptDashboard(r.dashboard as Dashboard);
       setUndo(null);
       setNotice('직전 이동을 되돌렸습니다.');
     } catch (e) {
@@ -418,7 +442,7 @@ export default function Page() {
       mutationActive.current = false;
       setBusy(false);
     }
-  }, [api, refresh, undo]);
+  }, [api, refresh, undo, acceptDashboard]);
   useEffect(() => {
     if (!undo) return;
     const timer = setTimeout(
@@ -438,12 +462,20 @@ export default function Page() {
   useEffect(() => {
     if (!session?.authenticated) return;
     queueMicrotask(() => void refresh().catch(() => {}));
-    const timer = setInterval(() => void refresh().catch(() => {}), 60000);
-    const onFocus = () => void refresh().catch(() => {});
+    const onFocus = () => {
+      if (
+        document.visibilityState === 'visible' &&
+        Date.now() - lastRefreshAt.current >= 15000
+      )
+        void refresh().catch(() => {});
+    };
+    const timer = setInterval(onFocus, 60000);
     window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onFocus);
     return () => {
       clearInterval(timer);
       window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onFocus);
     };
   }, [session?.authenticated, refresh]);
   useEffect(() => {
@@ -478,7 +510,7 @@ export default function Page() {
           application ? body : { ...body, id: job.id },
         );
         refreshEpoch.current += 1;
-        if (r.dashboard) setData(r.dashboard as Dashboard);
+        if (r.dashboard) acceptDashboard(r.dashboard as Dashboard);
         else await refresh(true);
         setModal(null);
         setNote('');
@@ -502,7 +534,7 @@ export default function Page() {
         setBusy(false);
       }
     },
-    [api, refresh, moveJob],
+    [api, refresh, moveJob, acceptDashboard],
   );
   useEffect(() => {
     const context = (
@@ -1047,6 +1079,19 @@ export default function Page() {
                                 )}
                               </div>
                               <div className="job-actions">
+                                {savingJobId === j.id && (
+                                  <output
+                                    className="saving-state"
+                                    aria-live="polite"
+                                  >
+                                    <RefreshCw
+                                      size={13}
+                                      className="spin"
+                                      aria-hidden="true"
+                                    />
+                                    저장 중
+                                  </output>
+                                )}
                                 <VisitLink job={j} />
                                 {isMovable(j) && (
                                   <div className="action-group">
@@ -1314,6 +1359,7 @@ export default function Page() {
                           archive={data[status]}
                           api={api}
                           busy={busy}
+                          savingJobId={savingJobId}
                           onDecision={openDecision}
                           onMove={moveJob}
                           onHistory={setHistoryJob}
@@ -1491,6 +1537,7 @@ function ArchivePanel({
   archive,
   api,
   busy,
+  savingJobId,
   onDecision,
   onMove,
   onHistory,
@@ -1501,6 +1548,7 @@ function ArchivePanel({
   archive: Archive;
   api: (path: string) => Promise<Record<string, unknown>>;
   busy: boolean;
+  savingJobId: string | null;
   onDecision: (job: Job, status: string) => void;
   onMove: (job: Job, status: MoveStatus) => Promise<unknown>;
   onHistory: (job: Job) => void;
@@ -1642,6 +1690,12 @@ function ArchivePanel({
           )}
         </div>
         <div className="job-actions">
+          {savingJobId === j.id && (
+            <output className="saving-state" aria-live="polite">
+              <RefreshCw size={13} className="spin" aria-hidden="true" />
+              저장 중
+            </output>
+          )}
           <VisitLink job={j} />
           {isMovable(j) && (
             <div className="action-group">
