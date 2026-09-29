@@ -8,6 +8,7 @@ import contextlib
 import copy
 import datetime as dt
 import fcntl
+import functools
 import hashlib
 import hmac
 import http.cookies
@@ -38,6 +39,29 @@ STATUSES_KO = {'Evaluated': '검토 완료', 'Applied': '지원 완료', 'Respon
 SITES = {'wanted': '원티드', 'remember': '리멤버', 'saramin': '사람인', 'jobkorea': '잡코리아', 'jumpit': '점핏', 'linkedin': 'LinkedIn', 'jobplanet': '잡플래닛', 'direct': '기업 채용', 'greeting': '그리팅', 'ninehire': '나인하이어', 'headhunter_mail': '헤드헌터 메일', 'company_mail': '기업 채용 메일', 'unknown': '출처 확인 필요'}
 SITE_DOMAINS = {'wanted.co.kr': 'wanted', 'rememberapp.co.kr': 'remember', 'jumpit.co.kr': 'jumpit', 'jumpit.saramin.co.kr': 'jumpit', 'saramin.co.kr': 'saramin', 'jobkorea.co.kr': 'jobkorea', 'linkedin.com': 'linkedin', 'jobplanet.co.kr': 'jobplanet', 'greetinghr.com': 'greeting', 'ninehire.com': 'ninehire'}
 MAX_BODY = 8192
+REQUEST_METRICS = threading.local()
+MOVEMENT_WARNING = '분류 변경의 저장 결과를 확인해야 하는 기록이 있습니다. 해당 공고의 상세 이력을 확인해 주세요.'
+
+
+def record_timing(name, started):
+    metrics = getattr(REQUEST_METRICS, 'value', None)
+    if metrics is not None:
+        metrics[name + '_ms'] = metrics.get(name + '_ms', 0) + (time.perf_counter() - started) * 1000
+        metrics[name + '_count'] = metrics.get(name + '_count', 0) + 1
+
+
+def measured(name):
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            started = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                record_timing(name, started)
+        return wrapped
+    return decorate
+
 MAIL_PHASE_LABELS = {'starting': '메일 동기화 준비', 'restoring_cache': '저장된 대화 확인', 'search_messages': '지원 관련 메일 검색', 'read_recent_threads': '검색된 메일 대화 확인', 'read_known_threads': '기존 지원 대화 재확인', 'validate': '수집 결과 확인', 'apply': '지원 상태 반영', 'complete': '동기화 완료'}
 MAIL_ERROR_MESSAGES = {
     'gmail_api_disabled': '연결된 Google 프로젝트에서 Gmail API를 사용 설정한 뒤 다시 동기화해 주세요.',
@@ -78,6 +102,7 @@ def read_json(path, missing=None):
         raise APIError(503, 'data_unreadable', '저장된 데이터를 읽을 수 없습니다. 기존 기록을 보존하고 작업을 중단했습니다.')
 
 
+@measured('write')
 def atomic_json(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +145,12 @@ def safe_url(value):
 
 
 def canonical_url(value):
+    # Only immutable input/output is retained across requests; no status or time.
+    return _canonical_url(clean(value, 2048))
+
+
+@functools.lru_cache(maxsize=8192)
+def _canonical_url(value):
     value = safe_url(value)
     if not value:
         return ''
@@ -145,12 +176,15 @@ def canonical_url(value):
 
 
 def aliases(job):
-    result = set()
-    for name in ('id', 'posting_cluster_id', 'listing_instance_id'):
-        if job.get(name):
-            result.add(str(job[name]))
+    identifiers = tuple(str(job[name]) for name in ('id', 'posting_cluster_id', 'listing_instance_id') if job.get(name))
     values = list(job.get('aliases') or [])
     values += [job.get(k) for k in ('url', 'canonical_url', 'apply_url', 'source_url')]
+    return set(_alias_values(identifiers, tuple(value for value in values if isinstance(value, str) and value)))
+
+
+@functools.lru_cache(maxsize=16384)
+def _alias_values(identifiers, values):
+    result = set(identifiers)
     for value in values:
         if not isinstance(value, str) or not value:
             continue
@@ -160,7 +194,7 @@ def aliases(job):
     result.discard('')
     if any(value.startswith(('li_', 'https://', 'http://')) for value in result):
         result = {value for value in result if not value.startswith('pc_')}
-    return result
+    return frozenset(result)
 
 
 def job_id(job):
@@ -290,6 +324,7 @@ class Store:
         self._tracker_stamp = None
         self._report_url_cache = {}
         self._lock_local = threading.local()
+        self._lookup_local = threading.local()
         self._mail_process = None
         self._mail_launch_at = None
         self._mail_history_cache = None
@@ -327,6 +362,7 @@ class Store:
 
     @contextlib.contextmanager
     def lock(self):
+        started = time.perf_counter()
         with self.mutex:
             if getattr(self._lock_local, 'depth', 0):
                 self._lock_local.depth += 1
@@ -339,6 +375,7 @@ class Store:
             with open(str(self.c.decisions) + '.lock', 'a') as stream:
                 os.chmod(stream.name, 0o600)
                 fcntl.flock(stream, fcntl.LOCK_EX)
+                record_timing('lock_wait', started)
                 self._lock_local.depth = 1
                 try:
                     yield
@@ -346,6 +383,27 @@ class Store:
                     self._lock_local.depth = 0
                     fcntl.flock(stream, fcntl.LOCK_UN)
 
+    @contextlib.contextmanager
+    def lookup_scope(self):
+        # A fresh view of mutable files for each snapshot, including after writes.
+        previous = getattr(self._lookup_local, 'cache', None)
+        self._lookup_local.cache = {}
+        try:
+            yield
+        finally:
+            self._lookup_local.cache = previous
+
+    def lookup(self, name, source, build):
+        cache = getattr(self._lookup_local, 'cache', None)
+        if cache is None:
+            return build()
+        key = (name, id(source))
+        if key not in cache:
+            # Retain the source so an object id cannot be recycled in this scope.
+            cache[key] = (source, build())
+        return cache[key][1]
+
+    @measured('canonical')
     def run_node(self, args, extra_env=None):
         env = dict(os.environ, CAREER_OPS_TRACKER=str(self.c.tracker), CAREER_OPS_TRACKER_LOCK_TIMEOUT_MS='8000')
         env.update(extra_env or {})
@@ -436,6 +494,9 @@ class Store:
         return next(iter(urls)) if len(urls) == 1 else ''
 
     def tracker_job(self, row):
+        return copy.deepcopy(self.lookup('tracker_job', row, lambda: self._tracker_job(row)))
+
+    def _tracker_job(self, row):
         urls = [safe_url(u.rstrip(';,.')) for u in re.findall(r'https?://[^\s<>\]\)]+', row.get('notes', ''))]
         urls = [url for url in urls if url]
         original_url = self.report_url(row) or (urls[0] if urls else '')
@@ -454,34 +515,115 @@ class Store:
         return row.get('raw_hash') or hashlib.sha256(json.dumps(row, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:24]
 
     def matched_row(self, job, rows, export_rows=None):
+        def build():
+            ids, by_alias, by_role = {}, {}, {}
+            for index, row in enumerate(rows):
+                ids.setdefault(str(row['num']), []).append(index)
+                for alias in aliases(self.tracker_job(row)):
+                    by_alias.setdefault(alias, set()).add(index)
+                by_role.setdefault((normalize(row['company']), normalize(row['role'])), []).append(index)
+            return ids, by_alias, by_role
+
+        ids, by_alias, by_role = self.lookup('tracker_index', rows, build)
         tracker_id = job.get('tracker_id')
         if tracker_id is not None:
-            matches = [r for r in rows if str(r['num']) == str(tracker_id)]
+            matches = [rows[index] for index in ids.get(str(tracker_id), ())]
             if len(matches) == 1 and not conflicting_posting(job, self.tracker_job(matches[0])):
                 return matches[0]
-        job_aliases = aliases(job)
-        matches = []
-        for row in rows:
-            if aliases(self.tracker_job(row)) & job_aliases and not conflicting_posting(job, self.tracker_job(row)):
-                matches.append(row)
+        candidates = set()
+        for alias in aliases(job):
+            candidates.update(by_alias.get(alias, ()))
+        matches = [rows[index] for index in sorted(candidates) if not conflicting_posting(job, self.tracker_job(rows[index]))]
         if len(matches) == 1:
             return matches[0]
         # Exact normalized company AND full role only. Company alone may be another role.
-        matches = [r for r in rows if normalize(r['company']) == normalize(job.get('company')) and normalize(r['role']) == normalize(job.get('title') or job.get('role')) and not conflicting_posting(job, self.tracker_job(r))]
+        candidates = by_role.get((normalize(job.get('company')), normalize(job.get('title') or job.get('role'))), ())
+        matches = [rows[index] for index in candidates if not conflicting_posting(job, self.tracker_job(rows[index]))]
         if len(matches) == 1:
             return matches[0]
         return None
 
-    @staticmethod
-    def matching_decision(job, decisions):
-        aa = aliases(job)
-        matches = [(key, d) for key, d in decisions.items() if key in aa or aa & (aliases(d) | aliases(d.get('job') or {}))]
+    def matching_decision(self, job, decisions):
+        def build():
+            entries, by_alias = list(decisions.items()), {}
+            for index, (key, decision) in enumerate(entries):
+                for alias in {key} | aliases(decision) | aliases(decision.get('job') or {}):
+                    by_alias.setdefault(alias, set()).add(index)
+            return entries, by_alias
+
+        entries, by_alias = self.lookup('decision_index', decisions, build)
+        candidates = set()
+        for alias in aliases(job):
+            candidates.update(by_alias.get(alias, ()))
+        matches = [entries[index] for index in sorted(candidates)]
         if not matches:
             return None, None
         return max(matches, key=lambda pair: pair[1].get('updated_at', ''))
 
-    def snapshot(self):
-        with self.mutex:
+    def recommendation_selection(self, groups, export, jobs, decisions, rows, eligible, refill=False):
+        """Keep this collection's review slots until a new collection or explicit refill."""
+        path = self.c.data / 'dashboard-recommendations.json'
+        batch = read_json(path, {'version': 1, 'source_key': None, 'sites': []})
+        if (not isinstance(batch, dict) or batch.get('version') != 1 or 'source_key' not in batch
+                or (batch['source_key'] is not None and (not isinstance(batch['source_key'], str)
+                    or not isinstance(batch.get('selected_at'), str) or not batch['selected_at']))
+                or not isinstance(batch.get('sites'), list)
+                or any(not isinstance(group, dict) or not isinstance(group.get('id'), str)
+                       or not isinstance(group.get('jobs'), list) or len(group['jobs']) > 5
+                       or any(not isinstance(job, dict) or not isinstance(job.get('id'), str) or not job['id'] for job in group['jobs'])
+                       for group in batch['sites'])):
+            raise APIError(503, 'recommendations_invalid', '추천 목록의 저장 상태를 확인해야 합니다. 기존 검토 기록은 보존했습니다.')
+        if len({group['id'] for group in batch['sites']}) != len(batch['sites']):
+            raise APIError(503, 'recommendations_invalid', '추천 목록의 출처를 확인해야 합니다. 기존 검토 기록은 보존했습니다.')
+        # generated_at also changes on re-export. Only a new collection should
+        # replace the current review slots; older exporters have no run timestamp.
+        source_key = export.get('source_run_at') or export.get('generated_at')
+        if not source_key:
+            source_key = hashlib.sha256(json.dumps(export, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+        if refill or batch['source_key'] != source_key:
+            batch = {'version': 1, 'source_key': source_key, 'selected_at': now(),
+                     'sites': [{'id': group['id'], 'name': group['name'], 'jobs': copy.deepcopy(group['jobs'])}
+                               for group in groups.values()]}
+            atomic_json(path, batch)
+        by_alias = {alias: job for job in reversed(jobs) for alias in aliases(job)}
+        for group in groups.values():
+            group['jobs'] = []
+        reviewed = 0
+        selected_aliases = set()
+        for selected in batch['sites']:
+            group = groups.setdefault(selected['id'], {'id': selected['id'], 'name': selected.get('name', selected['id']), 'total': 0, 'jobs': []})
+            for saved in selected['jobs']:
+                raw = next((by_alias[alias] for alias in sorted(aliases(saved)) if alias in by_alias), saved)
+                job = copy.deepcopy(raw)
+                if aliases(job) & selected_aliases:
+                    continue
+                selected_aliases |= aliases(job)
+                _, decision = self.matching_decision(job, decisions)
+                row = self.matched_row(job, rows)
+                if decision and decision.get('withdrawn') and decision['status'] == 'excluded':
+                    category = 'excluded'
+                elif row and is_application(row, decision):
+                    category = 'applied'
+                elif row and row['status'] in {'SKIP', 'Discarded'}:
+                    category = 'excluded'
+                else:
+                    category = (decision or {}).get('status', 'new')
+                if row:
+                    job.update(tracker_id=row['num'], canonical_status=row['status'], canonical_status_label=STATUSES_KO[row['status']])
+                if decision:
+                    job.update(updated_at=decision.get('updated_at', ''), decided_at=decision.get('effective_at') or decision.get('updated_at', ''))
+                unavailable = category == 'new' and not aliases(job) & eligible
+                job.update(decision_status=category, recommendation_reviewed=category != 'new' or unavailable,
+                           recommendation_unavailable=bool(unavailable))
+                reviewed += int(job['recommendation_reviewed'])
+                group['jobs'].append(job)
+        return {'selected_at': batch['selected_at'], 'source_run_at': export.get('source_run_at') or export.get('generated_at'),
+                'reviewed_count': reviewed}
+
+    @measured('snapshot')
+    def snapshot(self, refill=False):
+        # Selection persistence shares the decision lock with manual/mail updates.
+        with self.lock(), self.lookup_scope():
             export = self.export_data()
             decisions = self.decision_data()
             rows = self.tracker_rows()
@@ -550,7 +692,7 @@ class Store:
                 else:
                     continue
                 groups[sid] = {'id': sid, 'name': name, 'total': 0, 'jobs': []}
-            seen = set()
+            seen, eligible = set(), set()
             for job in jobs:
                 if not job['dashboard_eligible'] or job['liveness'] != 'active':
                     continue
@@ -576,11 +718,13 @@ class Store:
                     continue
                 if decision:
                     job['updated_at'] = decision.get('updated_at', '')
+                eligible |= aliases(job)
                 sid = job['site']
                 group = groups.setdefault(sid, {'id': sid, 'name': job['site_name'], 'total': 0, 'jobs': []})
                 group['total'] += 1
                 if len(group['jobs']) < 5:
                     group['jobs'].append(job)
+            selection = self.recommendation_selection(groups, export, jobs, decisions['decisions'], rows, eligible, refill)
             pending.sort(key=lambda j: j.get('decided_at') or j.get('updated_at', ''), reverse=True)
             excluded.sort(key=lambda j: j.get('decided_at') or j.get('date', ''), reverse=True)
             applications.sort(key=lambda j: j.get('date') or j.get('published_at') or j.get('updated_at', ''), reverse=True)
@@ -598,20 +742,25 @@ class Store:
             if (self.c.data / 'dashboard-write-journal.json').exists():
                 warnings.append('완료 여부를 확인해야 하는 상태 변경이 있습니다. 표시된 지원 이력과 검토 상태를 확인해 주세요.')
             if any(e.get('state') in {'prepared', 'verification_required'} for e in self.movement_data()['events']):
-                warnings.append('분류 변경의 저장 결과를 확인해야 하는 기록이 있습니다. 해당 공고의 상세 이력을 확인해 주세요.')
+                warnings.append(MOVEMENT_WARNING)
             if stale:
                 warnings.append('마지막 수집 시점이 오래되었거나 확인되지 않았습니다. 공고 원문에서 현재 모집 여부를 확인해 주세요.')
             status_counts = {s: sum(x.get('canonical_status') == s for x in applications) for s in CANONICAL}
-            result = {'generated_at': export.get('generated_at'), 'source_run_at': source_run_at, 'updated_at': decisions.get('updated_at', ''), 'served_at': now(), 'sites': list(groups.values()), 'applications': applications, 'pending': {'items': pending[:5], 'total': len(pending), 'sources': archive_sources(pending)}, 'excluded': {'items': excluded[:5], 'total': len(excluded), 'sources': archive_sources(excluded)}, 'stats': {'recommended': sum(len(g['jobs']) for g in groups.values()), 'available': sum(g['total'] for g in groups.values()), 'applications': len(applications), 'pending': len(pending), 'excluded': len(excluded), 'application_statuses': status_counts}, 'canonical_statuses': [{'id': s, 'label': STATUSES_KO[s]} for s in CANONICAL], 'stale': stale, 'warnings': warnings}
+            result = {'generated_at': export.get('generated_at'), 'source_run_at': source_run_at, 'updated_at': decisions.get('updated_at', ''), 'served_at': now(), 'sites': list(groups.values()), 'recommendation_batch': selection, 'applications': applications, 'pending': {'items': pending[:5], 'total': len(pending), 'sources': archive_sources(pending)}, 'excluded': {'items': excluded[:5], 'total': len(excluded), 'sources': archive_sources(excluded)}, 'stats': {'recommended': sum(not j['recommendation_reviewed'] for g in groups.values() for j in g['jobs']), 'available': sum(g['total'] for g in groups.values()), 'applications': len(applications), 'pending': len(pending), 'excluded': len(excluded), 'application_statuses': status_counts}, 'canonical_statuses': [{'id': s, 'label': STATUSES_KO[s]} for s in CANONICAL], 'stale': stale, 'warnings': warnings}
             ledger = self.mail_ledger()
             for category, items in [('new', [j for g in groups.values() for j in g['jobs']]), ('applied', applications), ('pending', pending), ('excluded', excluded)]:
                 for item in items:
-                    self.decorate_job(item, category, decisions['decisions'], rows, ledger, export['jobs'])
+                    self.decorate_job(item, item['decision_status'] if category == 'new' else category, decisions['decisions'], rows, ledger, export['jobs'])
+                    if item.get('recommendation_unavailable'):
+                        item.update(movable=False, allowed_moves=[], movement_disabled_reason='현재 모집 여부를 확인할 수 없는 공고입니다.')
             result['mail_sync'] = self.mail_sync_status()
             return result, {'pending': pending, 'excluded': excluded}, (export, decisions, rows, jobs)
 
     def dashboard(self):
         return self.snapshot()[0]
+
+    def refill_recommendations(self):
+        return {'ok': True, 'dashboard': self.snapshot(refill=True)[0]}
 
     def archive(self, status, offset, limit, site='all'):
         items = self.snapshot()[1][status]
@@ -678,7 +827,7 @@ class Store:
             self.run_node(['tracker.mjs', 'sync'])
             return matches[0]
 
-    def _decide_legacy(self, body, restore_metadata=None, restore_canonical_status=None):
+    def _decide_legacy(self, body, restore_metadata=None, restore_canonical_status=None, *, before=None, render_dashboard=True):
         status, ident = body.get('status'), body.get('id')
         if status not in {'pending', 'excluded', 'applied', 'new'} or not isinstance(ident, str) or not ident or len(ident) > 256:
             raise APIError(400, 'invalid_decision', '공고와 변경할 상태를 확인해 주세요.')
@@ -687,7 +836,7 @@ class Store:
             raise APIError(400, 'invalid_note', '메모는 1,000자 이내로 입력해 주세요.')
         note = re.sub(r'[\r\n\t|]+', ' ', note).strip()
         with self.lock():
-            dashboard, archive, (export, data, rows, jobs) = self.snapshot()
+            dashboard, archive, (export, data, rows, jobs) = before if before is not None else self.snapshot()
             job = next((j for j in jobs if j['id'] == ident or ident in aliases(j)), None)
             if job is None:
                 decision = data['decisions'].get(ident)
@@ -781,11 +930,11 @@ class Store:
                     raise
                 raise APIError(503, 'decision_save_failed', '상태 저장을 완료하지 못했습니다. 화면을 새로고침하여 현재 기록을 확인해 주세요.', partial_commit=committed)
             try:
-                updated_dashboard = self.dashboard()
+                updated_dashboard = self.dashboard() if render_dashboard else None
             except APIError as exc:
                 exc.details['partial_commit'] = True
                 raise
-            return {'ok': True, 'decision': record, 'dashboard': updated_dashboard}
+            return {'ok': True, 'decision': record, **({'dashboard': updated_dashboard} if render_dashboard else {})}
 
     def mail_ledger(self):
         ledger = read_json(self.c.data / 'dashboard-mail-ledger.json', {'version': 1, 'events': {}, 'runs': {}})
@@ -805,7 +954,16 @@ class Store:
 
     def can_restore_recommendation(self, job, previous=None, exported=None):
         exported = self.export_data()['jobs'] if exported is None else exported
-        current = next((j for j in exported if aliases(j) & aliases(job)), None)
+        def build():
+            by_alias = {}
+            for index, item in enumerate(exported):
+                for alias in aliases(item):
+                    by_alias.setdefault(alias, (index, item))
+            return by_alias
+
+        by_alias = self.lookup('export_index', exported, build)
+        matches = [by_alias[alias] for alias in aliases(job) if alias in by_alias]
+        current = min(matches, key=lambda pair: pair[0])[1] if matches else None
         evidence = current or (previous or {}).get('job') or job
         try:
             verified = dt.datetime.fromisoformat(str(evidence.get('verified_at', '')).replace('Z', '+00:00'))
@@ -891,7 +1049,8 @@ class Store:
         if strict and not isinstance(body.get('expected_updated_at'), str):
             raise APIError(400, 'revision_required', '현재 기록의 버전이 필요합니다. 새로고침해 주세요.')
         with self.lock():
-            job, key, previous, row, data = self.job_context(ident)
+            before = self.snapshot()
+            job, key, previous, row, data = self.job_context(ident, before)
             expected = body.get('expected_updated_at')
             allowed = {job['decision_revision']}
             if not strict:
@@ -903,7 +1062,7 @@ class Store:
                 raise APIError(409, code, job.get('movement_disabled_reason', '지원 이력은 드래그로 변경할 수 없습니다.'))
             old_status = job['movement_status']
             if old_status == status:
-                return {'ok': True, 'unchanged': True, 'dashboard': self.dashboard()}
+                return {'ok': True, 'unchanged': True, 'dashboard': before[0]}
             if status == 'new' and strict:
                 # The latest export is authoritative; archived evidence may be stale or closed.
                 if not self.can_restore_recommendation(job, previous):
@@ -915,20 +1074,30 @@ class Store:
             movement['events'].append(movement_event)
             atomic_json(self.c.data / 'dashboard-movements.json', movement)
             try:
-                result = self._decide_legacy({'id': ident, 'status': status, 'note': note})
+                result = self._decide_legacy({'id': ident, 'status': status, 'note': note}, before=before, render_dashboard=False)
             except APIError as error:
                 movement_event['state'] = 'verification_required' if error.details.get('partial_commit') else 'failed'
                 atomic_json(self.c.data / 'dashboard-movements.json', movement)
                 raise
-            # Keep the pre-write journal and its prior reason through any process interruption.
-            changed_job, _, changed_decision, _, _ = self.job_context(ident)
-            token = secrets.token_urlsafe(32)
-            expires = time.time() + 10
-            movement_event['state'] = 'committed'
-            movement['undos'] = {k: v for k, v in movement['undos'].items() if v.get('expires', 0) > time.time()}
-            movement['undos'][hashlib.sha256(token.encode()).hexdigest()] = {'job_id': key, 'from': old_status, 'previous': copy.deepcopy(previous), 'previous_note': clean(job.get('note'), 1000), 'previous_canonical_status': row['status'] if row else None, 'expected_revision': changed_job['decision_revision'], 'expires': expires, 'event_id': event_id}
-            atomic_json(self.c.data / 'dashboard-movements.json', movement)
-            result.update(dashboard=self.dashboard(), undo_token=token, undo_expires_at=dt.datetime.fromtimestamp(expires, dt.timezone.utc).isoformat().replace('+00:00', 'Z'))
+            try:
+                # Commit the journal before building the final view, so it cannot
+                # contain a warning about this already completed operation.
+                movement_event['state'] = 'committed'
+                atomic_json(self.c.data / 'dashboard-movements.json', movement)
+                after = self.snapshot()
+                changed_job = self.job_context(ident, after)[0]
+                token = secrets.token_urlsafe(32)
+                # No further snapshot calculation consumes the undo window.
+                expires = time.time() + 10
+                movement['undos'] = {k: v for k, v in movement['undos'].items() if v.get('expires', 0) > time.time()}
+                movement['undos'][hashlib.sha256(token.encode()).hexdigest()] = {'job_id': key, 'from': old_status, 'previous': copy.deepcopy(previous), 'previous_note': clean(job.get('note'), 1000), 'previous_canonical_status': row['status'] if row else None, 'expected_revision': changed_job['decision_revision'], 'expires': expires, 'event_id': event_id}
+                atomic_json(self.c.data / 'dashboard-movements.json', movement)
+                result.update(dashboard=after[0], undo_token=token, undo_expires_at=dt.datetime.fromtimestamp(expires, dt.timezone.utc).isoformat().replace('+00:00', 'Z'))
+            except APIError as error:
+                error.details['partial_commit'] = True
+                raise
+            except OSError:
+                raise APIError(503, 'movement_save_failed', '분류는 저장했지만 후속 정보를 완료하지 못했습니다. 새로고침하여 현재 상태를 확인해 주세요.', partial_commit=True)
             return result
 
     def undo_move(self, body):
@@ -941,7 +1110,8 @@ class Store:
             undo = data['undos'].get(token_hash)
             if not undo or undo.get('expires', 0) <= time.time():
                 raise APIError(409, 'undo_expired', '실행 취소 시간이 지났습니다. 현재 목록에서 다시 분류해 주세요.')
-            job, key, previous, row, decisions = self.job_context(undo['job_id'])
+            before = self.snapshot()
+            job, key, previous, row, decisions = self.job_context(undo['job_id'], before)
             if job['decision_revision'] != undo['expected_revision']:
                 raise APIError(409, 'undo_conflict', '이후 메일이나 다른 화면에서 기록이 변경되어 취소하지 않았습니다. 최신 기록을 확인해 주세요.')
             if not job['movable']:
@@ -952,7 +1122,7 @@ class Store:
             data['events'].append(undo_event)
             atomic_json(self.c.data / 'dashboard-movements.json', data)
             try:
-                self._decide_legacy({'id': key, 'status': undo['from'], 'note': previous_note}, restore_metadata=old, restore_canonical_status=undo.get('previous_canonical_status'))
+                self._decide_legacy({'id': key, 'status': undo['from'], 'note': previous_note}, restore_metadata=old, restore_canonical_status=undo.get('previous_canonical_status'), before=before, render_dashboard=False)
             except APIError as error:
                 undo_event['state'] = 'verification_required' if error.details.get('partial_commit') else 'failed'
                 atomic_json(self.c.data / 'dashboard-movements.json', data)
@@ -977,7 +1147,8 @@ class Store:
             movements = self.movement_data()
             movements['events'].append({'id': secrets.token_hex(16), 'job_id': key, 'job_aliases': sorted(aliases(job)), 'at': now(), 'kind': 'note', 'note': note, 'source': 'manual'})
             atomic_json(self.c.data / 'dashboard-movements.json', movements)
-            return {'ok': True, 'dashboard': self.dashboard(), 'job': self.job_context(ident)[0]}
+            after = self.snapshot()
+            return {'ok': True, 'dashboard': after[0], 'job': self.job_context(ident, after)[0]}
 
     def job_history(self, ident):
         job, key, decision, row, _ = self.job_context(ident)
@@ -1266,6 +1437,7 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(30)
 
     def send(self, status, data, cookie=None, content_type='application/json; charset=utf-8', script_hashes=(), extra_headers=None):
+        self.response_status = status
         payload = json.dumps(data, ensure_ascii=False).encode() if not isinstance(data, bytes) else data
         self.send_response(status)
         for name, value in {
@@ -1275,11 +1447,15 @@ class Handler(BaseHTTPRequestHandler):
             'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
             'Content-Security-Policy': "default-src 'self'; script-src 'self'" + (' ' + ' '.join(script_hashes) if script_hashes else '') + "; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
             'X-Robots-Tag': 'noindex, nofollow, noarchive',
+            **(extra_headers or {}),
         }.items():
             self.send_header(name, value)
         if cookie:
             self.send_header('Set-Cookie', cookie)
-        for name, value in (extra_headers or {}).items(): self.send_header(name, value)
+        metrics = getattr(REQUEST_METRICS, 'value', {})
+        timing = ', '.join(f'{name};dur={metrics[name + "_ms"]:.2f}' for name in ('snapshot', 'lock_wait', 'write', 'canonical') if name + '_ms' in metrics)
+        if timing:
+            self.send_header('Server-Timing', timing)
         self.end_headers()
         if self.command != 'HEAD':
             self.wfile.write(payload)
@@ -1423,6 +1599,21 @@ class Handler(BaseHTTPRequestHandler):
                          extra_headers={'Location': '/?mail_connection=' + result})
 
     def handle_request(self):
+        started = time.perf_counter()
+        REQUEST_METRICS.value = {}
+        self.response_status = None
+        try:
+            return self._handle_request()
+        finally:
+            path = urlsplit(self.path).path
+            # Only fixed route names, never job ids, query values, or payloads.
+            fixed = {'/healthz', '/api/session', '/api/login', '/api/logout', '/api/dashboard', '/api/decisions', '/api/moves', '/api/moves/undo', '/api/recommendations/refill', '/api/mail-sync', '/api/mail-connection'}
+            route = path if path in fixed else '/api/jobs/:id/' + path.rsplit('/', 1)[-1] if re.fullmatch(r'/api/jobs/[^/]+/(history|note)', path) else '/api/applications/:id' if re.fullmatch(r'/api/applications/\d+', path) else '/api/other' if path.startswith('/api/') else '/static'
+            metrics = {key: round(value, 3) if key.endswith('_ms') else value for key, value in REQUEST_METRICS.value.items()}
+            logging.info('career_request %s', json.dumps({'route': route, 'method': self.command, 'status': self.response_status, 'total_ms': round((time.perf_counter() - started) * 1000, 3), **metrics}, separators=(',', ':')))
+            del REQUEST_METRICS.value
+
+    def _handle_request(self):
         try:
             parsed = urlsplit(self.path)
             path = parsed.path
@@ -1451,6 +1642,10 @@ class Handler(BaseHTTPRequestHandler):
                 self.require_auth()
                 if method == 'GET' and path == '/api/dashboard':
                     return self.send(200, self.server.store.dashboard())
+                if method == 'POST' and path == '/api/recommendations/refill':
+                    self.require_csrf()
+                    self.json_body()
+                    return self.send(200, self.server.store.refill_recommendations())
                 if method == 'GET' and path == '/api/decisions':
                     params = parse_qs(parsed.query)
                     status = params.get('status', [''])[0]
@@ -1515,7 +1710,13 @@ class Handler(BaseHTTPRequestHandler):
             if not target.is_relative_to(static_root) or not target.exists() or target.suffix in {'.map', '.py', '.json', '.env'}:
                 raise APIError(404, 'file_missing', '파일을 찾을 수 없습니다.')
             payload = target.read_bytes()
-            return self.send(200, payload, content_type=mimetypes.guess_type(target.name)[0] or 'application/octet-stream', script_hashes=inline_script_hashes(payload) if target.suffix == '.html' else ())
+            # Only content-addressed build assets are immutable. Authenticated
+            # API responses keep no-store; HTML must discover the next release.
+            cache = 'no-cache' if target.suffix == '.html' else 'no-store'
+            relative = target.relative_to(static_root).as_posix()
+            if relative.startswith('_next/static/') and re.search(r'[.-][A-Za-z0-9_-]{8,}\.(?:js|css|woff2?)$', target.name):
+                cache = 'public, max-age=31536000, immutable'
+            return self.send(200, payload, content_type=mimetypes.guess_type(target.name)[0] or 'application/octet-stream', script_hashes=inline_script_hashes(payload) if target.suffix == '.html' else (), extra_headers={'Cache-Control': cache})
         except APIError as error:
             if self.command not in {'GET', 'HEAD'}:
                 self.close_connection = True
@@ -1533,6 +1734,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     parser = argparse.ArgumentParser()
     parser.add_argument('--hash-password', action='store_true')
     parser.add_argument('--check', action='store_true')

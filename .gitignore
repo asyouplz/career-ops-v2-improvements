@@ -73,6 +73,11 @@ staging/
 **/*.test.*
 **/*.spec.*
 **/test_*.py
+# Dashboard regressions below contain only generated synthetic records.
+!dashboard/backend/tests/
+!dashboard/backend/tests/*.py
+!dashboard/web/tests/
+!dashboard/web/tests/*.test.mjs
 **/*_test.go
 **/demo.gif
 

@@ -12,6 +12,8 @@ export type Job = {
   updated_at?: string;
   decision_revision?: string;
   decision_status?: string;
+  recommendation_reviewed?: boolean;
+  recommendation_unavailable?: boolean;
   movement_status?: MoveStatus | null;
   movable?: boolean;
   allowed_moves?: MoveStatus[];
@@ -85,6 +87,11 @@ export type Dashboard = {
   source_run_at?: string;
   updated_at: string;
   served_at?: string;
+  recommendation_batch?: {
+    selected_at: string;
+    source_run_at: string;
+    reviewed_count: number;
+  };
   sites: { id: string; name: string; total: number; jobs: Job[] }[];
   applications: Job[];
   pending: Archive;

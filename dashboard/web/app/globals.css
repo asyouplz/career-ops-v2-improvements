@@ -781,6 +781,18 @@ h2 {
 .section-head {
   margin: var(--sp-6) 0 var(--sp-4);
 }
+.recommendation-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-4);
+}
+.recommendation-head > div {
+  min-width: 0;
+}
+.refill-button {
+  flex-shrink: 0;
+}
 .section-note {
   margin: var(--sp-1) 0 0;
   color: var(--text-muted);
@@ -923,6 +935,27 @@ h2 {
 .job-row:hover,
 .app-row:hover {
   background: var(--surface-hover);
+}
+.job-row.job-reviewed {
+  background: var(--surface-subtle);
+}
+.job-reviewed .job-title {
+  color: var(--text-muted);
+}
+.job-reviewed .fit {
+  color: var(--text-muted);
+}
+.recommendation-state {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--sp-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: var(--neutral-surface);
+  color: var(--text-body);
+  font-size: var(--fs-2xs);
+  font-weight: 650;
+  line-height: 20px;
 }
 .archive-row {
   grid-template-columns: minmax(0, 1fr) auto auto;
@@ -1094,7 +1127,6 @@ h2 {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
-
 
 /* Controls: one bordered shape for every action, link colour for anything that opens or navigates. */
 .action-group {
@@ -1657,7 +1689,9 @@ h2 {
   -webkit-user-select: none;
   cursor: grab;
   flex-shrink: 0;
-  transition: background var(--ease), color var(--ease);
+  transition:
+    background var(--ease),
+    color var(--ease);
 }
 .move-handle:hover,
 .move-handle:focus-visible {
@@ -2132,6 +2166,17 @@ h2 {
   .section-note {
     display: none;
   }
+  .recommendation-head {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--sp-3);
+  }
+  .recommendation-head .recommendation-note {
+    display: block;
+  }
+  .refill-button {
+    min-height: var(--tap-touch);
+  }
   .search-toggle {
     display: grid;
     place-items: center;
@@ -2318,4 +2363,12 @@ h2 {
     transition: none !important;
     scroll-behavior: auto !important;
   }
+}
+.saving-state {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--sp-1);
+  color: var(--text-muted);
+  font-size: var(--fs-xs);
+  white-space: nowrap;
 }
